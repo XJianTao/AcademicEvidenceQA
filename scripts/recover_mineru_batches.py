@@ -60,17 +60,32 @@ def main() -> None:
                         blocks.extend(block for block in payload if isinstance(block, dict))
                 normalized = [normalize_mineru_block(block) for block in blocks]
                 flags = Counter(flag for block in normalized for flag in block["quality_flags"])
-                pages = [block["physical_page_start"] for block in normalized if block["physical_page_start"]]
-                print(json.dumps({
-                    "source_sha256": record["source_sha256"], "page_count": record["page_count"],
-                    "remote_state": state, "polls_to_completion": record.get("poll_count", 0) + 1,
-                    "initial_attempt_seconds": record.get("elapsed_seconds"),
-                    "recovery_wait_seconds": round(time.monotonic() - started, 3),
-                    "block_count": len(normalized), "page_min": min(pages) if pages else None,
-                    "page_max": max(pages) if pages else None, "quality_flags": dict(flags),
-                    "normalized_hash": hashlib.sha256(json.dumps(normalized, sort_keys=True, ensure_ascii=False).encode()).hexdigest(),
-                    "result_zip_sha256": archive_hash,
-                }, ensure_ascii=False))
+                pages = [
+                    block["physical_page_start"]
+                    for block in normalized
+                    if block["physical_page_start"]
+                ]
+                print(
+                    json.dumps(
+                        {
+                            "source_sha256": record["source_sha256"],
+                            "page_count": record["page_count"],
+                            "remote_state": state,
+                            "polls_to_completion": record.get("poll_count", 0) + 1,
+                            "initial_attempt_seconds": record.get("elapsed_seconds"),
+                            "recovery_wait_seconds": round(time.monotonic() - started, 3),
+                            "block_count": len(normalized),
+                            "page_min": min(pages) if pages else None,
+                            "page_max": max(pages) if pages else None,
+                            "quality_flags": dict(flags),
+                            "normalized_hash": hashlib.sha256(
+                                json.dumps(normalized, sort_keys=True, ensure_ascii=False).encode()
+                            ).hexdigest(),
+                            "result_zip_sha256": archive_hash,
+                        },
+                        ensure_ascii=False,
+                    )
+                )
     finally:
         client.close()
 

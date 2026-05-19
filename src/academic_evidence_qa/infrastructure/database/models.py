@@ -19,7 +19,9 @@ from sqlalchemy import (
     DateTime,
     ForeignKey,
     ForeignKeyConstraint,
+    JSON,
     String,
+    Text,
     UniqueConstraint,
     func,
 )
@@ -181,3 +183,124 @@ class BuildIntent(Base):
     library_id: Mapped[UUID] = mapped_column(ForeignKey("libraries.library_id"))
     membership_revision: Mapped[int] = mapped_column(BigInteger)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class ParseTask(Base):
+    """最小解析任务
+
+    保存单次显式执行的远端标识、取消请求和失败诊断，不实现租约或队列领取。
+
+    Args:
+        document_version_id: 固定输入版本，任务不会随成员选版变化。
+        parser_backend, parser_config_id: 不含密钥的稳定配置身份。
+        allow_remote_processing: 每次导入明确记录的外发授权。
+    Returns:
+        可在同一明确 job_id 下继续远端查询的持久化检查点。
+    """
+
+    __tablename__ = "parse_tasks"
+    __table_args__ = (
+        CheckConstraint(
+            "state IN ('queued', 'executing', 'failed', 'cancelled', 'completed')",
+            name="ck_parse_task_state",
+        ),
+        CheckConstraint("length(trim(parser_backend)) > 0", name="ck_parse_task_backend"),
+        CheckConstraint("length(trim(parser_config_id)) > 0", name="ck_parse_task_config"),
+    )
+    parse_task_id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
+    document_version_id: Mapped[UUID] = mapped_column(
+        ForeignKey("document_versions.document_version_id")
+    )
+    parser_backend: Mapped[str] = mapped_column(String(128))
+    parser_config_id: Mapped[str] = mapped_column(String(128))
+    allow_remote_processing: Mapped[bool]
+    state: Mapped[str] = mapped_column(String(16), server_default="queued")
+    stage: Mapped[str] = mapped_column(String(64), server_default="accepted")
+    attempt_id: Mapped[UUID] = mapped_column(default=uuid4)
+    executor_token: Mapped[UUID | None]
+    cancel_requested: Mapped[bool] = mapped_column(server_default="false")
+    remote_task_id: Mapped[str | None] = mapped_column(String(512))
+    error_code: Mapped[str | None] = mapped_column(String(128))
+    checkpoint: Mapped[dict] = mapped_column(JSON, server_default="{}")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class ParseSnapshotRecord(Base):
+    """不可变解析快照元数据
+
+    文件产物已先由 FileStore 原子保存，本表仅在短事务内提交可回收的引用。
+    """
+
+    __tablename__ = "parse_snapshots"
+    __table_args__ = (
+        UniqueConstraint(
+            "document_version_id",
+            "parser_backend",
+            "parser_config_id",
+            "adapter_version",
+            "normalized_artifact_sha256",
+            name="uq_snapshot_content_identity",
+        ),
+        CheckConstraint(
+            "quality_state IN ('usable', 'usable_with_warnings', 'rejected')",
+            name="ck_snapshot_quality",
+        ),
+        CheckConstraint("input_sha256 ~ '^[0-9a-f]{64}$'", name="ck_snapshot_input_sha256"),
+        CheckConstraint("raw_artifact_sha256 ~ '^[0-9a-f]{64}$'", name="ck_snapshot_raw_sha256"),
+        CheckConstraint(
+            "normalized_artifact_sha256 ~ '^[0-9a-f]{64}$'", name="ck_snapshot_normalized_sha256"
+        ),
+    )
+    parse_snapshot_id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
+    document_version_id: Mapped[UUID] = mapped_column(
+        ForeignKey("document_versions.document_version_id")
+    )
+    input_sha256: Mapped[str] = mapped_column(String(64))
+    parser_backend: Mapped[str] = mapped_column(String(128))
+    parser_config_id: Mapped[str] = mapped_column(String(128))
+    adapter_version: Mapped[str] = mapped_column(String(128))
+    remote_version: Mapped[str] = mapped_column(String(256), server_default="unknown")
+    actual_resource_config: Mapped[dict] = mapped_column(JSON)
+    quality_state: Mapped[str] = mapped_column(String(32))
+    quality_metrics: Mapped[dict] = mapped_column(JSON)
+    raw_artifact_key: Mapped[str] = mapped_column(String(256))
+    raw_artifact_sha256: Mapped[str] = mapped_column(String(64))
+    normalized_artifact_key: Mapped[str] = mapped_column(String(256))
+    normalized_artifact_sha256: Mapped[str] = mapped_column(String(64))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class ParseSection(Base):
+    """不可变快照章节；阅读顺序在同一快照内唯一。"""
+
+    __tablename__ = "parse_sections"
+    __table_args__ = (
+        UniqueConstraint("parse_snapshot_id", "reading_order", name="uq_section_reading_order"),
+        CheckConstraint("reading_order >= 0", name="ck_section_reading_order"),
+    )
+    section_id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
+    parse_snapshot_id: Mapped[UUID] = mapped_column(ForeignKey("parse_snapshots.parse_snapshot_id"))
+    title: Mapped[str | None] = mapped_column(String(4096))
+    level: Mapped[int | None]
+    reading_order: Mapped[int]
+    locations: Mapped[list] = mapped_column(JSON)
+
+
+class ParseBlock(Base):
+    """不可变快照块；正文、位置和质量标记与所属快照共同冻结。"""
+
+    __tablename__ = "parse_blocks"
+    __table_args__ = (
+        UniqueConstraint("parse_snapshot_id", "reading_order", name="uq_block_reading_order"),
+        CheckConstraint("reading_order >= 0", name="ck_block_reading_order"),
+        CheckConstraint("length(trim(block_type)) > 0", name="ck_block_type"),
+    )
+    block_id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
+    parse_snapshot_id: Mapped[UUID] = mapped_column(ForeignKey("parse_snapshots.parse_snapshot_id"))
+    block_type: Mapped[str] = mapped_column(String(128))
+    reading_order: Mapped[int]
+    text: Mapped[str] = mapped_column(Text)
+    locations: Mapped[list] = mapped_column(JSON)
+    raw_provenance: Mapped[dict] = mapped_column(JSON)
+    quality_flags: Mapped[list] = mapped_column(JSON)

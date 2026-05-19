@@ -14,6 +14,7 @@
 
 import asyncio
 from datetime import datetime, timezone
+from dataclasses import asdict
 from typing import BinaryIO
 from uuid import UUID
 
@@ -24,19 +25,29 @@ from academic_evidence_qa.contracts.documents import (
     DocumentError,
     MemberCommand,
     MemberResult,
+    ParsedDocument,
     ParserSelection,
     RegisteredDocument,
 )
+from academic_evidence_qa.contracts.jobs import ParseTaskCheckpoint, ParseTaskRequest
 from academic_evidence_qa.infrastructure.database import repositories
 from academic_evidence_qa.infrastructure.database.models import (
     BuildIntent,
     DocumentVersion,
     Library,
     LibraryPaper,
+    ParseBlock,
+    ParseSection,
+    ParseSnapshotRecord,
+    ParseTask,
     Paper,
     StoredFile,
 )
-from academic_evidence_qa.infrastructure.local_file_store import LocalFileStore, StoredObject
+from academic_evidence_qa.infrastructure.local_file_store import (
+    LocalFileStore,
+    StoredArtifact,
+    StoredObject,
+)
 
 
 class DocumentService:
@@ -100,6 +111,31 @@ class DocumentService:
         stored = await asyncio.to_thread(self.file_store.write, source)
         return await self._register_object(session, stored, paper_id, title)
 
+    async def register_verified_document(
+        self,
+        session: AsyncSession,
+        stored: StoredObject,
+        *,
+        paper_id: UUID | None = None,
+        title: str | None = None,
+    ) -> RegisteredDocument:
+        """登记已验证原件。
+
+        Args:
+            session: 调用方已开启的短事务。
+            stored: 仅由 LocalFileStore 从受限预检后的 staging 发布的对象。
+            paper_id, title: 明确论文身份或新论文展示标题。
+        Returns:
+            已提交前的固定文档版本身份。
+        Raises:
+            DocumentError: 对象不存在、损坏或论文身份冲突。
+
+        事务：此方法绝不执行文件 I/O，使上传/预检不延长数据库锁。
+        """
+        self._require_transaction(session)
+        await asyncio.to_thread(self.file_store.verify, stored)
+        return await self._register_object(session, stored, paper_id, title)
+
     async def register_in_library(
         self,
         session: AsyncSession,
@@ -136,6 +172,247 @@ class DocumentService:
             session.add(member)
             await self._record_change(session, library)
         return document, self._member_result(library, member, changed)
+
+    async def register_verified_in_library(
+        self,
+        session: AsyncSession,
+        stored: StoredObject,
+        *,
+        library_id: UUID,
+        expected_membership_revision: int,
+        parser: ParserSelection,
+        paper_id: UUID | None = None,
+        title: str | None = None,
+    ) -> tuple[RegisteredDocument, MemberResult]:
+        """将预检后原件以短事务登记到库。
+
+        Args:
+            session: 显式事务；先锁 Library，再在 `_register_object` 锁哈希。
+            stored: 已由 FileStore 发布且刚复核完整性的服务对象。
+            library_id, expected_membership_revision, parser: M1-A 成员修订契约。
+            paper_id, title: 可选的明确论文身份/展示标题。
+        Returns:
+            固定版本和成员修订结果。
+        """
+        # 文件完整性校验放在库锁之前，避免磁盘 I/O 延长成员修订锁的持有时间。
+        await asyncio.to_thread(self.file_store.verify, stored)
+        library = await self._checked_library(session, library_id, expected_membership_revision)
+        document = await self._register_object(session, stored, paper_id, title)
+        member = await repositories.find_member(session, library_id, document.paper_id)
+        changed = member is None
+        if member is None:
+            member = self._new_member(
+                library_id, document.paper_id, document.document_version_id, parser
+            )
+            session.add(member)
+            await self._record_change(session, library)
+        return document, self._member_result(library, member, changed)
+
+    async def create_parse_task(
+        self, session: AsyncSession, request: ParseTaskRequest
+    ) -> ParseTaskCheckpoint:
+        """创建不自动执行的最小解析任务。"""
+        self._require_transaction(session)
+        if await session.get(DocumentVersion, request.document_version_id) is None:
+            raise DocumentError("document_version_not_found", 404)
+        task = ParseTask(
+            document_version_id=request.document_version_id,
+            parser_backend=request.parser_backend,
+            parser_config_id=request.parser_config_id,
+            allow_remote_processing=request.allow_remote_processing,
+        )
+        session.add(task)
+        await session.flush()
+        return self._task_checkpoint(task)
+
+    async def begin_parse_task(
+        self,
+        session: AsyncSession,
+        parse_task_id: UUID,
+        executor_token: UUID,
+        *,
+        attempt_id: UUID,
+    ) -> ParseTaskCheckpoint:
+        """核验数据库 attempt 后绑定唯一执行器；不提供跨执行器重领。"""
+        self._require_transaction(session)
+        task = await repositories.lock_parse_task(session, parse_task_id)
+        if task is None:
+            raise DocumentError("parse_task_not_found", 404)
+        if task.attempt_id != attempt_id:
+            raise DocumentError("parse_task_attempt_conflict", 409)
+        if task.cancel_requested:
+            task.state, task.stage = "cancelled", "cancelled"
+        elif task.state == "queued":
+            task.state, task.stage, task.executor_token = "executing", "starting", executor_token
+        elif task.state == "executing":
+            raise DocumentError("parse_task_already_executing", 409)
+        else:
+            raise DocumentError("parse_task_not_executable", 409)
+        task.updated_at = datetime.now(timezone.utc)
+        await session.flush()
+        return self._task_checkpoint(task)
+
+    async def request_parse_cancellation(
+        self, session: AsyncSession, parse_task_id: UUID
+    ) -> ParseTaskCheckpoint:
+        """持久化取消请求；已完成任务不会删除其快照或产物。"""
+        self._require_transaction(session)
+        task = await repositories.lock_parse_task(session, parse_task_id)
+        if task is None:
+            raise DocumentError("parse_task_not_found", 404)
+        if task.state == "completed":
+            raise DocumentError("parse_task_already_completed", 409)
+        task.cancel_requested = True
+        if task.state == "queued":
+            task.state, task.stage = "cancelled", "cancelled"
+        task.updated_at = datetime.now(timezone.utc)
+        await session.flush()
+        return self._task_checkpoint(task)
+
+    async def checkpoint_parse_task(
+        self,
+        session: AsyncSession,
+        *,
+        parse_task_id: UUID,
+        executor_token: UUID,
+        stage: str,
+        remote_task_id: str | None = None,
+        checkpoint: dict | None = None,
+    ) -> ParseTaskCheckpoint:
+        """持久化已知远端标识和可继续检查点，不执行网络请求。"""
+        self._require_transaction(session)
+        task = await self._locked_executing_task(session, parse_task_id, executor_token)
+        if checkpoint is not None and (
+            not isinstance(checkpoint, dict) or checkpoint.get("attempt_id") != str(task.attempt_id)
+        ):
+            raise DocumentError("parse_task_attempt_conflict", 409)
+        # 取消也保留已经取得的远端身份和原 attempt 期限，便于诊断；
+        # 这里只冻结已知事实，取消状态仍阻止后续远端工作和快照提交。
+        if remote_task_id is not None:
+            task.remote_task_id = remote_task_id
+        if checkpoint is not None:
+            task.checkpoint = checkpoint
+        if task.cancel_requested:
+            task.state, task.stage = "cancelled", "cancelled"
+        else:
+            task.stage = stage
+        task.updated_at = datetime.now(timezone.utc)
+        await session.flush()
+        return self._task_checkpoint(task)
+
+    async def fail_parse_task(
+        self,
+        session: AsyncSession,
+        *,
+        parse_task_id: UUID,
+        executor_token: UUID,
+        error_code: str,
+    ) -> ParseTaskCheckpoint:
+        """将已受理任务标记为失败或取消，稳定错误码不保存远端原文。"""
+        self._require_transaction(session)
+        task = await self._locked_executing_task(session, parse_task_id, executor_token)
+        task.state = "cancelled" if task.cancel_requested else "failed"
+        task.stage = task.state
+        task.error_code = error_code
+        task.updated_at = datetime.now(timezone.utc)
+        await session.flush()
+        return self._task_checkpoint(task)
+
+    async def save_parse_snapshot(
+        self,
+        session: AsyncSession,
+        *,
+        parse_task_id: UUID,
+        executor_token: UUID,
+        document: ParsedDocument,
+        adapter_version: str,
+        remote_version: str,
+        actual_resource_config: dict,
+        raw_artifact: StoredArtifact,
+        normalized_artifact: StoredArtifact,
+    ) -> UUID:
+        """在短事务中冻结 ParseSnapshot、章节和块，并完成任务。
+
+        调用方必须先保存并验证两个不可变产物。取消请求在本事务锁内再次检查，
+        因而取消已提交时不会新增完整快照。
+        """
+        self._require_transaction(session)
+        task = await self._locked_executing_task(session, parse_task_id, executor_token)
+        if task.cancel_requested:
+            task.state, task.stage = "cancelled", "cancelled"
+            await session.flush()
+            raise DocumentError("parse_task_cancelled", 409)
+        version = await session.get(DocumentVersion, task.document_version_id)
+        if version is None:
+            raise DocumentError("document_version_not_found", 404)
+        await asyncio.to_thread(self.file_store.verify_artifact, raw_artifact)
+        await asyncio.to_thread(self.file_store.verify_artifact, normalized_artifact)
+        existing = await repositories.find_complete_snapshot(
+            session,
+            document_version_id=version.document_version_id,
+            parser_backend=task.parser_backend,
+            parser_config_id=task.parser_config_id,
+            adapter_version=adapter_version,
+            normalized_artifact_sha256=normalized_artifact.sha256,
+        )
+        if existing is None:
+            snapshot = ParseSnapshotRecord(
+                document_version_id=version.document_version_id,
+                input_sha256=version.file_sha256,
+                parser_backend=task.parser_backend,
+                parser_config_id=task.parser_config_id,
+                adapter_version=adapter_version,
+                remote_version=remote_version or "unknown",
+                actual_resource_config=actual_resource_config,
+                quality_state=document.quality_state,
+                quality_metrics=document.quality_metrics,
+                raw_artifact_key=raw_artifact.object_key,
+                raw_artifact_sha256=raw_artifact.sha256,
+                normalized_artifact_key=normalized_artifact.object_key,
+                normalized_artifact_sha256=normalized_artifact.sha256,
+            )
+            session.add(snapshot)
+            await session.flush()
+            session.add_all(
+                ParseSection(
+                    parse_snapshot_id=snapshot.parse_snapshot_id,
+                    title=section.title,
+                    level=section.level,
+                    reading_order=section.reading_order,
+                    locations=[asdict(location) for location in section.locations],
+                )
+                for section in document.sections
+            )
+            session.add_all(
+                ParseBlock(
+                    parse_snapshot_id=snapshot.parse_snapshot_id,
+                    block_type=block.block_type,
+                    reading_order=block.reading_order,
+                    text=block.text,
+                    locations=[asdict(location) for location in block.locations],
+                    raw_provenance=block.raw_provenance,
+                    quality_flags=list(block.quality_flags),
+                )
+                for block in document.blocks
+            )
+            await session.flush()
+        else:
+            snapshot = existing
+            # 复用前重新验证数据库记录的两个不可变产物；调用方传入的同哈希参数不足以证明文件仍在。
+            await asyncio.to_thread(
+                self.file_store.verify_artifact_reference,
+                snapshot.raw_artifact_key,
+                expected_sha256=snapshot.raw_artifact_sha256,
+            )
+            await asyncio.to_thread(
+                self.file_store.verify_artifact_reference,
+                snapshot.normalized_artifact_key,
+                expected_sha256=snapshot.normalized_artifact_sha256,
+            )
+        task.state, task.stage, task.error_code = "completed", "completed", None
+        task.updated_at = datetime.now(timezone.utc)
+        await session.flush()
+        return snapshot.parse_snapshot_id
 
     async def set_member(
         self,
@@ -288,6 +565,29 @@ class DocumentService:
             version.file_sha256,
             stored.size_bytes,
             reused,
+        )
+
+    async def _locked_executing_task(
+        self, session: AsyncSession, parse_task_id: UUID, executor_token: UUID
+    ) -> ParseTask:
+        """检查任务锁和明确执行身份，防止两个显式执行器同时提交。"""
+        task = await repositories.lock_parse_task(session, parse_task_id)
+        if task is None:
+            raise DocumentError("parse_task_not_found", 404)
+        if task.state != "executing" or task.executor_token != executor_token:
+            raise DocumentError("parse_task_executor_conflict", 409)
+        return task
+
+    @staticmethod
+    def _task_checkpoint(task: ParseTask) -> ParseTaskCheckpoint:
+        return ParseTaskCheckpoint(
+            task.parse_task_id,
+            task.attempt_id,
+            task.state,
+            task.stage,
+            task.remote_task_id,
+            task.cancel_requested,
+            task.error_code,
         )
 
     @staticmethod

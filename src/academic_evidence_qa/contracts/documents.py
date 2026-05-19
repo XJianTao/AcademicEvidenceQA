@@ -1,4 +1,4 @@
-"""模块：文档与成员契约
+"""模块：文档、解析与成员契约
 
 定义与 ORM 无关的登记结果、成员命令和可映射 HTTP 的领域错误。
 
@@ -11,7 +11,8 @@
   - 此处不定义 HTTP 路由或完整 Job 契约。
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import Any, Literal
 from uuid import UUID
 
 
@@ -122,3 +123,108 @@ class MemberResult:
     status: str
     membership_revision: int
     changed: bool
+
+
+QualityState = Literal["usable", "usable_with_warnings", "rejected"]
+PositionReliability = Literal["located", "page_only", "unlocated", "range_incomplete"]
+
+
+@dataclass(frozen=True)
+class ReceivedPdf:
+    """名称：受限接收结果。用途概要：描述尚未登记的可信暂存 PDF。
+
+    Args:
+        upload_id: 服务生成的暂存目录身份。
+        staging_path: 仅服务内部使用的可信绝对路径。
+        size_bytes, sha256: 接收层逐块计算的实际值。
+    Returns:
+        仅能由上传模块创建并交给预检/原件存储的对象。
+    """
+
+    upload_id: UUID
+    staging_path: str
+    size_bytes: int
+    sha256: str
+
+
+@dataclass(frozen=True)
+class PdfPreflightResult:
+    """名称：PDF 预检结果。用途概要：记录受限子进程给出的结构结论。"""
+
+    page_count: int
+    is_encrypted: bool
+
+
+@dataclass(frozen=True)
+class SourceLocation:
+    """名称：来源位置。用途概要：保存 parser 原始位置和规范化位置。
+
+    Args:
+        page_index: 0-based 物理页；未知时为 None。
+        bbox: 旋转后 CropBox 显示坐标中的 0–1 左上原点矩形。
+        reliability: 明确区分页级、无位置和不完整范围。
+        raw_provenance: 保留可得 parser 字段，不能替代规范化坐标。
+    Returns:
+        可序列化的不可变来源位置。
+    """
+
+    page_index: int | None
+    bbox: tuple[float, float, float, float] | None
+    reliability: PositionReliability
+    raw_provenance: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class ParsedBlock:
+    """名称：解析块。用途概要：统一文本、表格、公式和算法的保存格式。"""
+
+    block_type: str
+    reading_order: int
+    text: str
+    locations: tuple[SourceLocation, ...]
+    raw_provenance: dict[str, Any] = field(default_factory=dict)
+    quality_flags: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class ParsedSection:
+    """名称：解析章节。用途概要：保存明确的标题层级，不推断缺失关系。"""
+
+    title: str | None
+    level: int | None
+    reading_order: int
+    locations: tuple[SourceLocation, ...]
+
+
+@dataclass(frozen=True)
+class ParsedDocument:
+    """名称：标准解析文档。用途概要：解析器到不可变快照的中间契约。
+
+    Args:
+        sections, blocks: 统一阅读顺序的结构，原文始终保留在块内。
+        quality_state, quality_metrics: 可复核质量结论及计数。
+        metadata: 仅直接从文档确认的元数据和来源。
+    Returns:
+        可安全序列化为标准化产物的不可变解析结果。
+    """
+
+    sections: tuple[ParsedSection, ...]
+    blocks: tuple[ParsedBlock, ...]
+    quality_state: QualityState
+    quality_metrics: dict[str, int]
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class ParseSnapshot:
+    """名称：解析快照。用途概要：绑定固定版本与固定解析产物身份。"""
+
+    parse_snapshot_id: UUID
+    document_version_id: UUID
+    input_sha256: str
+    parser_backend: str
+    parser_config_id: str
+    adapter_version: str
+    quality_state: QualityState
+    raw_artifact_sha256: str
+    normalized_artifact_sha256: str

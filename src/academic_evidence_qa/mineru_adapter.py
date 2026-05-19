@@ -42,7 +42,9 @@ def normalize_mineru_block(block: dict[str, Any]) -> dict[str, Any]:
     kind = str(block.get("type", "")).lower()
     if "table" in kind and not _text(original.get("table_body")):
         quality.append("empty_table_body")
-    if any(token in kind for token in ("code", "algorithm")) and not _text(original.get("code_body")):
+    if any(token in kind for token in ("code", "algorithm")) and not _text(
+        original.get("code_body")
+    ):
         quality.append("empty_code_body")
     if "\ufffd" in retrieval_text:
         quality.append("replacement_character")
@@ -55,7 +57,9 @@ def normalize_mineru_block(block: dict[str, Any]) -> dict[str, Any]:
     return {
         "retrieval_text": retrieval_text,
         "provenance": provenance,
-        "physical_page_start": page_idx + 1 if isinstance(page_idx, int) and page_idx >= 0 else None,
+        "physical_page_start": page_idx + 1
+        if isinstance(page_idx, int) and page_idx >= 0
+        else None,
         "physical_page_end": page_idx + 1 if isinstance(page_idx, int) and page_idx >= 0 else None,
         "position_reliability": "block_start_only" if isinstance(page_idx, int) else "unknown",
         "quality_flags": quality,

@@ -34,6 +34,26 @@ class Settings:
 
     database_url: URL
     data_root: Path
+    pdf_max_upload_bytes: int = 100 * 1024 * 1024
+    pdf_max_pages: int = 300
+    pdf_preflight_timeout_seconds: int = 30
+    pdf_preflight_memory_mib: int = 512
+    local_parse_timeout_seconds: int = 900
+    local_parse_memory_mib: int = 8192
+    mineru_job_timeout_seconds: int = 1800
+    mineru_max_retries: int = 2
+    remote_connect_timeout_seconds: int = 10
+    remote_read_timeout_seconds: int = 60
+    result_max_download_bytes: int = 512 * 1024 * 1024
+    result_max_extracted_bytes: int = 2 * 1024 * 1024 * 1024
+    result_max_files: int = 10_000
+    result_max_json_bytes: int = 128 * 1024 * 1024
+    result_extract_timeout_seconds: int = 120
+    result_extract_memory_mib: int = 1024
+    normalization_timeout_seconds: int = 120
+    normalization_memory_mib: int = 2048
+    local_parser_concurrency: int = 1
+    parser_queue_capacity: int = 2
 
 
 def load_settings() -> Settings:
@@ -64,4 +84,36 @@ def load_settings() -> Settings:
     )
     if url.drivername != "postgresql+psycopg":
         raise ValueError("DATABASE_URL 必须使用 postgresql+psycopg")
-    return Settings(url, Path(os.getenv("DATA_ROOT", "data")))
+
+    def positive_int(name: str, default: int) -> int:
+        value = int(os.getenv(name, str(default)))
+        if value <= 0:
+            raise ValueError(f"{name} 必须为正整数")
+        return value
+
+    return Settings(
+        url,
+        Path(os.getenv("DATA_ROOT", "data")),
+        pdf_max_upload_bytes=positive_int("PDF_MAX_UPLOAD_BYTES", 100 * 1024 * 1024),
+        pdf_max_pages=positive_int("PDF_MAX_PAGES", 300),
+        pdf_preflight_timeout_seconds=positive_int("PDF_PREFLIGHT_TIMEOUT_SECONDS", 30),
+        pdf_preflight_memory_mib=positive_int("PDF_PREFLIGHT_MEMORY_MIB", 512),
+        local_parse_timeout_seconds=positive_int("LOCAL_PARSE_TIMEOUT_SECONDS", 900),
+        local_parse_memory_mib=positive_int("LOCAL_PARSE_MEMORY_MIB", 8192),
+        mineru_job_timeout_seconds=positive_int("MINERU_JOB_TIMEOUT_SECONDS", 1800),
+        mineru_max_retries=positive_int("MINERU_MAX_RETRIES", 2),
+        remote_connect_timeout_seconds=positive_int("REMOTE_CONNECT_TIMEOUT_SECONDS", 10),
+        remote_read_timeout_seconds=positive_int("REMOTE_READ_TIMEOUT_SECONDS", 60),
+        result_max_download_bytes=positive_int("RESULT_MAX_DOWNLOAD_BYTES", 512 * 1024 * 1024),
+        result_max_extracted_bytes=positive_int(
+            "RESULT_MAX_EXTRACTED_BYTES", 2 * 1024 * 1024 * 1024
+        ),
+        result_max_files=positive_int("RESULT_MAX_FILES", 10_000),
+        result_max_json_bytes=positive_int("RESULT_MAX_JSON_BYTES", 128 * 1024 * 1024),
+        result_extract_timeout_seconds=positive_int("RESULT_EXTRACT_TIMEOUT_SECONDS", 120),
+        result_extract_memory_mib=positive_int("RESULT_EXTRACT_MEMORY_MIB", 1024),
+        normalization_timeout_seconds=positive_int("NORMALIZATION_TIMEOUT_SECONDS", 120),
+        normalization_memory_mib=positive_int("NORMALIZATION_MEMORY_MIB", 2048),
+        local_parser_concurrency=positive_int("LOCAL_PARSER_CONCURRENCY", 1),
+        parser_queue_capacity=positive_int("PARSER_QUEUE_CAPACITY", 2),
+    )

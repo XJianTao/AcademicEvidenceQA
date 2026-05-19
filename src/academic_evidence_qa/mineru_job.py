@@ -54,7 +54,9 @@ def wait_for_mineru_result(
         MineruJobError: 服务返回失败终态或参数非法。
     """
     if timeout_seconds <= 0 or max_attempts <= 0 or poll_interval_seconds < 0:
-        raise ValueError("timeout_seconds、max_attempts 必须为正数，poll_interval_seconds 不得为负数")
+        raise ValueError(
+            "timeout_seconds、max_attempts 必须为正数，poll_interval_seconds 不得为负数"
+        )
 
     started = monotonic()
     for attempt in range(max_attempts):

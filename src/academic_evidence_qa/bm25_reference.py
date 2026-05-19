@@ -18,7 +18,9 @@ def tokenize(text: str) -> list[str]:
     return re.findall(r"[a-z0-9]+|[\u4e00-\u9fff]", text.lower())
 
 
-def bm25_vectors(documents: list[str], vocabulary: list[str] | None = None) -> list[dict[int, float]]:
+def bm25_vectors(
+    documents: list[str], vocabulary: list[str] | None = None
+) -> list[dict[int, float]]:
     """计算以整数词项 ID 为键的 BM25 稀疏权重。"""
     tokenized = [tokenize(document) for document in documents]
     terms = vocabulary or sorted({term for tokens in tokenized for term in tokens})
@@ -33,11 +35,14 @@ def bm25_vectors(documents: list[str], vocabulary: list[str] | None = None) -> l
             if term not in ids:
                 continue
             idf = math.log(
-                1 + (len(tokenized) - document_frequency[term] + 0.5)
+                1
+                + (len(tokenized) - document_frequency[term] + 0.5)
                 / (document_frequency[term] + 0.5)
             )
-            length_norm = frequency * 2.2 / (
-                frequency + 1.2 * (0.25 + 0.75 * len(terms) / max(average_length, 1))
+            length_norm = (
+                frequency
+                * 2.2
+                / (frequency + 1.2 * (0.25 + 0.75 * len(terms) / max(average_length, 1)))
             )
             weights[ids[term]] = idf * length_norm
         result.append(weights)

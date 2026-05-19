@@ -20,6 +20,8 @@ from academic_evidence_qa.infrastructure.database.models import (
     DocumentVersion,
     Library,
     LibraryPaper,
+    ParseSnapshotRecord,
+    ParseTask,
 )
 
 
@@ -99,4 +101,35 @@ async def find_member(
             LibraryPaper.paper_id == paper_id,
         )
         .execution_options(populate_existing=True)
+    )
+
+
+async def lock_parse_task(session: AsyncSession, parse_task_id: UUID) -> ParseTask | None:
+    """锁定一项最小解析任务，供显式执行、取消和快照提交互斥使用。"""
+    return await session.scalar(
+        select(ParseTask)
+        .where(ParseTask.parse_task_id == parse_task_id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
+
+
+async def find_complete_snapshot(
+    session: AsyncSession,
+    *,
+    document_version_id: UUID,
+    parser_backend: str,
+    parser_config_id: str,
+    adapter_version: str,
+    normalized_artifact_sha256: str,
+) -> ParseSnapshotRecord | None:
+    """按完整内容身份查询现存快照；调用方仍须验证原始/标准化产物哈希。"""
+    return await session.scalar(
+        select(ParseSnapshotRecord).where(
+            ParseSnapshotRecord.document_version_id == document_version_id,
+            ParseSnapshotRecord.parser_backend == parser_backend,
+            ParseSnapshotRecord.parser_config_id == parser_config_id,
+            ParseSnapshotRecord.adapter_version == adapter_version,
+            ParseSnapshotRecord.normalized_artifact_sha256 == normalized_artifact_sha256,
+        )
     )

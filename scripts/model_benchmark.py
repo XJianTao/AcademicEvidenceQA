@@ -17,14 +17,20 @@ def main() -> None:
     device = "cuda" if torch.cuda.is_available() else "cpu"
     dtype = torch.float16 if device == "cuda" else torch.float32
     report: dict[str, object] = {
-        "torch": torch.__version__, "cuda_available": torch.cuda.is_available(),
-        "cuda_runtime": torch.version.cuda, "device": device, "dtype": str(dtype),
-        "batch_size": 1, "input_characters": 90,
+        "torch": torch.__version__,
+        "cuda_available": torch.cuda.is_available(),
+        "cuda_runtime": torch.version.cuda,
+        "device": device,
+        "dtype": str(dtype),
+        "batch_size": 1,
+        "input_characters": 90,
     }
     if device == "cuda":
         torch.cuda.reset_peak_memory_stats()
     started = time.perf_counter()
-    embedder = SentenceTransformer(str(dense_path), device=device, local_files_only=True, model_kwargs={"torch_dtype": dtype})
+    embedder = SentenceTransformer(
+        str(dense_path), device=device, local_files_only=True, model_kwargs={"torch_dtype": dtype}
+    )
     report["embedding_cold_load_seconds"] = time.perf_counter() - started
     text = "We propose a graph model for collective sentiment analysis with improved F1."
     embedding_started = time.perf_counter()
@@ -43,11 +49,24 @@ def main() -> None:
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
     started = time.perf_counter()
-    reranker = CrossEncoder(str(reranker_path), device=device, max_length=512, local_files_only=True, automodel_args={"torch_dtype": dtype})
+    reranker = CrossEncoder(
+        str(reranker_path),
+        device=device,
+        max_length=512,
+        local_files_only=True,
+        automodel_args={"torch_dtype": dtype},
+    )
     report["reranker_cold_load_seconds"] = time.perf_counter() - started
-    pairs = [["What improves sentiment F1?", "The proposed model improves F1 on sentiment classification."],
-             ["What improves sentiment F1?", "The paper studies an unrelated database index."]]
-    token_count = len(reranker.tokenizer(pairs[0][0], pairs[0][1], truncation=True, max_length=512)["input_ids"])
+    pairs = [
+        [
+            "What improves sentiment F1?",
+            "The proposed model improves F1 on sentiment classification.",
+        ],
+        ["What improves sentiment F1?", "The paper studies an unrelated database index."],
+    ]
+    token_count = len(
+        reranker.tokenizer(pairs[0][0], pairs[0][1], truncation=True, max_length=512)["input_ids"]
+    )
     started = time.perf_counter()
     scores = reranker.predict(pairs, batch_size=1, convert_to_numpy=True)
     report["reranker_pair_seconds"] = time.perf_counter() - started
@@ -59,7 +78,10 @@ def main() -> None:
         report["peak_reserved_mib"] = round(torch.cuda.max_memory_reserved() / 1024**2, 1)
     try:
         import psutil
-        report["process_peak_rss_mib"] = round(psutil.Process().memory_info().peak_wset / 1024**2, 1)
+
+        report["process_peak_rss_mib"] = round(
+            psutil.Process().memory_info().peak_wset / 1024**2, 1
+        )
     except (ImportError, AttributeError):
         pass
     print(json.dumps(report, ensure_ascii=False, indent=2))

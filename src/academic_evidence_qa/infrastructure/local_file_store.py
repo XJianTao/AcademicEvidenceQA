@@ -42,6 +42,15 @@ class StoredObject:
     size_bytes: int
 
 
+@dataclass(frozen=True)
+class StoredArtifact:
+    """解析产物描述，键与 SHA-256 绑定且永不覆盖。"""
+
+    object_key: str
+    sha256: str
+    size_bytes: int
+
+
 class FileIntegrityError(Exception):
     """已有对象内容与登记不符；阻止复用，不自动修复或覆盖证据。"""
 
@@ -117,6 +126,119 @@ class LocalFileStore:
         finally:
             Path(temporary).unlink(missing_ok=True)
 
+    def write_verified_staged(
+        self,
+        staging_path: Path,
+        *,
+        expected_sha256: str,
+        expected_size_bytes: int,
+    ) -> StoredObject:
+        """保存已受限预检的服务暂存原件。
+
+        Args:
+            staging_path: 必须位于服务生成的 staging/<upload_id>/ 中的文件。
+            expected_sha256, expected_size_bytes: 接收层逐块计算的实际值。
+        Returns:
+            已原子保存或经完整性验证复用的原件描述。
+        Raises:
+            ValueError: 路径不属于服务暂存区或完整性不一致。
+        """
+        path = staging_path.resolve()
+        try:
+            path.relative_to(self.staging)
+        except ValueError as error:
+            raise ValueError("暂存路径不属于服务 staging 根目录") from error
+        if len(path.relative_to(self.staging).parts) != 2 or not path.is_file():
+            raise ValueError("暂存路径不是服务生成的单个上传文件")
+        with path.open("rb") as source:
+            stored = self.write(source)
+        if stored.file_sha256 != expected_sha256 or stored.size_bytes != expected_size_bytes:
+            raise FileIntegrityError("预检前后的原件完整性不一致")
+        return stored
+
+    def write_artifact(self, category: str, source: BinaryIO, *, max_bytes: int) -> StoredArtifact:
+        """保存不可变 parser 原始或标准化产物。
+
+        Args:
+            category: 固定服务类别，如 raw_parse 或 normalized_parse。
+            source: 已在受限子进程中生成的内容流。
+            max_bytes: 写入期间再次执行的实际字节上限。
+        Returns:
+            按内容哈希命名的不可变产物描述。
+        """
+        if not category.isidentifier() or max_bytes <= 0:
+            raise ValueError("无效产物类别或大小上限")
+        digest = hashlib.sha256()
+        size_bytes = 0
+        descriptor, temporary = tempfile.mkstemp(prefix=f"{category}-", dir=self.staging)
+        try:
+            with os.fdopen(descriptor, "wb") as output:
+                while chunk := source.read(CHUNK_BYTES):
+                    size_bytes += len(chunk)
+                    if size_bytes > max_bytes:
+                        raise ValueError("artifact_size_exceeded")
+                    digest.update(chunk)
+                    output.write(chunk)
+                output.flush()
+                os.fsync(output.fileno())
+            sha256 = digest.hexdigest()
+            key = f"artifacts/{category}/{sha256[:2]}/{sha256}"
+            destination = self.data_root / key
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                os.link(temporary, destination)
+            except FileExistsError:
+                artifact = StoredArtifact(key, sha256, size_bytes)
+                self.verify_artifact(artifact)
+                return artifact
+            return StoredArtifact(key, sha256, size_bytes)
+        finally:
+            Path(temporary).unlink(missing_ok=True)
+
+    def verify_artifact(self, artifact: StoredArtifact) -> None:
+        """验证既有不可变产物，不允许损坏内容被缓存复用。"""
+        self.verify_artifact_reference(
+            artifact.object_key,
+            expected_sha256=artifact.sha256,
+            expected_size_bytes=artifact.size_bytes,
+        )
+
+    def verify_artifact_reference(
+        self,
+        object_key: str,
+        *,
+        expected_sha256: str,
+        expected_size_bytes: int | None = None,
+    ) -> int:
+        """验证数据库中已记录的产物引用。
+
+        Args:
+            object_key: 数据库保存的相对产物键。
+            expected_sha256: 数据库保存的 SHA-256。
+            expected_size_bytes: 可选的登记大小；未提供时返回实际大小供调用方记录。
+        Returns:
+            实际字节数。
+        Raises:
+            FileIntegrityError: 路径越界、文件不存在或哈希/大小不一致。
+        """
+        path = (self.data_root / object_key).resolve()
+        if self.data_root not in path.parents:
+            raise FileIntegrityError("产物键越界")
+        digest = hashlib.sha256()
+        size_bytes = 0
+        try:
+            with path.open("rb") as source:
+                while chunk := source.read(CHUNK_BYTES):
+                    digest.update(chunk)
+                    size_bytes += len(chunk)
+        except OSError as error:
+            raise FileIntegrityError("产物文件不可读") from error
+        if digest.hexdigest() != expected_sha256 or (
+            expected_size_bytes is not None and size_bytes != expected_size_bytes
+        ):
+            raise FileIntegrityError("已有产物的大小或 SHA-256 不符")
+        return size_bytes
+
     def open(self, file_id: UUID) -> BinaryIO:
         """按身份读取
 
@@ -141,9 +263,12 @@ class LocalFileStore:
         """
         digest = hashlib.sha256()
         size_bytes = 0
-        with self.open(stored.file_id) as source:
-            while chunk := source.read(CHUNK_BYTES):
-                digest.update(chunk)
-                size_bytes += len(chunk)
+        try:
+            with self.open(stored.file_id) as source:
+                while chunk := source.read(CHUNK_BYTES):
+                    digest.update(chunk)
+                    size_bytes += len(chunk)
+        except OSError as error:
+            raise FileIntegrityError("已有原件不可读") from error
         if size_bytes != stored.size_bytes or digest.hexdigest() != stored.file_sha256:
             raise FileIntegrityError("已有原件的大小或 SHA-256 不符")
