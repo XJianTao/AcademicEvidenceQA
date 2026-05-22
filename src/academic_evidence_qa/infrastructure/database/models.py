@@ -1,4 +1,4 @@
-"""模块：M1-A 数据实体
+"""模块名称：文档、解析与索引数据实体
 
 持久化文件、论文、不可变版本、库成员与最小待构建意图。
 
@@ -6,7 +6,7 @@
   - 全局哈希唯一；复合外键保证文件哈希和选版归属；每库独立修订。
 
 工程要点：
-  - 不预建解析、索引或 Worker 实体；
+  - 仅映射当前已实现的文档、解析和索引任务；
   - 版本不可变由迁移内数据库触发器保护。
 """
 
@@ -49,7 +49,16 @@ class Library(Base):
     library_id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
     membership_revision: Mapped[int] = mapped_column(BigInteger, server_default="0")
     # M1-C 才建立 generation 外键；本阶段不会修改或解释该指针。
-    active_generation_id: Mapped[UUID | None]
+    active_generation_id: Mapped[UUID | None] = mapped_column(
+        ForeignKey(
+            "index_generations.generation_id", name="fk_library_active_generation", use_alter=True
+        )
+    )
+    building_generation_id: Mapped[UUID | None] = mapped_column(
+        ForeignKey(
+            "index_generations.generation_id", name="fk_library_building_generation", use_alter=True
+        )
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
@@ -304,3 +313,62 @@ class ParseBlock(Base):
     locations: Mapped[list] = mapped_column(JSON)
     raw_provenance: Mapped[dict] = mapped_column(JSON)
     quality_flags: Mapped[list] = mapped_column(JSON)
+
+
+class IndexGeneration(Base):
+    """名称：索引代。用途：冻结一次完整构建的输入、统计与 collection 绑定。
+
+    Args:
+        generation_id, attempt_id: 两种独立且不可复用的构建身份。
+        manifest: 固定成员、chunk、模型与词法统计的完整清单。
+    Returns:
+        仅在 building 阶段可发布或失败的数据库记录。
+    """
+
+    __tablename__ = "index_generations"
+    __table_args__ = (
+        UniqueConstraint("collection_name", name="uq_generation_collection"),
+        UniqueConstraint("attempt_id", name="uq_generation_attempt"),
+        CheckConstraint(
+            "state IN ('building', 'published', 'retired', 'failed')", name="ck_generation_state"
+        ),
+        CheckConstraint("membership_revision >= 0", name="ck_generation_revision"),
+    )
+    generation_id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
+    library_id: Mapped[UUID] = mapped_column(ForeignKey("libraries.library_id"))
+    attempt_id: Mapped[UUID]
+    membership_revision: Mapped[int] = mapped_column(BigInteger)
+    expected_active_generation_id: Mapped[UUID | None]
+    collection_name: Mapped[str] = mapped_column(String(160))
+    state: Mapped[str] = mapped_column(String(16), server_default="building")
+    manifest: Mapped[dict] = mapped_column(JSON, server_default="{}")
+    manifest_sha256: Mapped[str | None] = mapped_column(String(64))
+    error_code: Mapped[str | None] = mapped_column(String(128))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class IndexChunk(Base):
+    """名称：冻结索引块。用途：保存可回源的原块区间与派生检索文本。"""
+
+    __tablename__ = "index_chunks"
+    __table_args__ = (
+        UniqueConstraint("generation_id", "reading_order", name="uq_index_chunk_order"),
+        CheckConstraint("embedding_tokens > 0 AND embedding_tokens <= 600", name="ck_chunk_tokens"),
+        CheckConstraint("reranker_tokens > 0", name="ck_chunk_reranker_tokens"),
+    )
+    chunk_id: Mapped[UUID] = mapped_column(primary_key=True)
+    generation_id: Mapped[UUID] = mapped_column(ForeignKey("index_generations.generation_id"))
+    parse_snapshot_id: Mapped[UUID] = mapped_column(ForeignKey("parse_snapshots.parse_snapshot_id"))
+    document_version_id: Mapped[UUID] = mapped_column(
+        ForeignKey("document_versions.document_version_id")
+    )
+    paper_id: Mapped[UUID] = mapped_column(ForeignKey("papers.paper_id"))
+    reading_order: Mapped[int]
+    block_type: Mapped[str] = mapped_column(String(128))
+    retrieval_text: Mapped[str] = mapped_column(Text)
+    source_ranges: Mapped[list] = mapped_column(JSON)
+    source_locations: Mapped[list] = mapped_column(JSON)
+    quality_flags: Mapped[list] = mapped_column(JSON)
+    embedding_tokens: Mapped[int]
+    reranker_tokens: Mapped[int]
