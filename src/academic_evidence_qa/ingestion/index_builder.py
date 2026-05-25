@@ -31,7 +31,9 @@ class BuiltIndex:
     chunks: list[dict]
 
 
-def build_index(generation, sources: list[FixedSource], runtime, qdrant) -> BuiltIndex:
+def build_index(
+    generation, sources: list[FixedSource], runtime, qdrant, *, execution_check=None
+) -> BuiltIndex:
     """名称：构建暂存索引。用途：编码固定输入，不执行发布。
 
     Args:
@@ -39,6 +41,7 @@ def build_index(generation, sources: list[FixedSource], runtime, qdrant) -> Buil
         sources: 已核验且完整的成员来源。
         runtime: 有界单 owner 模型；空库可为 None。
         qdrant: 不删除历史集合的存储适配器。
+        execution_check: C2 线程安全停止检查，编码批次及外部写入边界执行。
     Returns:
         可持久化且可独立核验的完整构建结果。
     """
@@ -46,7 +49,18 @@ def build_index(generation, sources: list[FixedSource], runtime, qdrant) -> Buil
         build_chunks(sources, runtime.embedding_length, runtime.reranker_length) if sources else []
     )
     statistics = freeze_statistics([draft.retrieval_text for draft in drafts])
-    dense = runtime.encode([draft.retrieval_text for draft in drafts]) if drafts else []
+    dense = []
+    if execution_check:
+        batch_size = getattr(runtime, "batch_size", 4)
+        for offset in range(0, len(drafts), batch_size):
+            execution_check()
+            dense.extend(
+                runtime.encode(
+                    [draft.retrieval_text for draft in drafts[offset : offset + batch_size]]
+                )
+            )
+    elif drafts:
+        dense = runtime.encode([draft.retrieval_text for draft in drafts])
     if len(dense) != len(drafts):
         raise ValueError("embedding_count_mismatch")
     chunks, points = [], []
@@ -105,6 +119,10 @@ def build_index(generation, sources: list[FixedSource], runtime, qdrant) -> Buil
         "lexical_statistics": statistics.to_dict(),
         "statistics_sha256": statistics.sha256,
     }
+    if execution_check:
+        execution_check()
     qdrant.create(generation.collection_name)
+    if execution_check:
+        execution_check()
     qdrant.write(generation.collection_name, points)
     return BuiltIndex(manifest, content_hash(manifest), points, chunks)

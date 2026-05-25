@@ -2,11 +2,13 @@
 
 用途：通过 PostgreSQL Library 行锁实现同库互斥及发布前冲突检查。
 核心设计：模型/网络校验在事务外；事务仅冻结输入或切换活动指针。
-工程要点：失败不改活动指针；同库构建通过 Library 行锁和构建指针互斥。
+工程要点：失败不改活动指针；可选租约遵循 Library→Job→generation 锁顺序。
 """
 
 from datetime import datetime, timezone
+import asyncio
 import json
+from contextlib import suppress
 from uuid import UUID, uuid4
 
 from sqlalchemy import select
@@ -15,8 +17,10 @@ from academic_evidence_qa.infrastructure.database.models import (
     IndexChunk,
     IndexGeneration,
     Library,
+    BuildIntent,
 )
 from academic_evidence_qa.ingestion.index_builder import BuiltIndex, content_hash
+from academic_evidence_qa.infrastructure.database.repositories import check_index_lease
 
 
 class PublicationError(Exception):
@@ -50,7 +54,7 @@ def _check_manifest(generation, built):
         raise PublicationError("manifest_chunk_identity_mismatch")
 
 
-async def reserve_generation(database, library_id: UUID) -> IndexGeneration:
+async def reserve_generation(database, library_id: UUID, *, lease=None) -> IndexGeneration:
     """名称：预留构建。用途：短事务锁定 Library，拒绝同库并发构建。
 
     Args:
@@ -59,15 +63,31 @@ async def reserve_generation(database, library_id: UUID) -> IndexGeneration:
     Returns:
         固定修订、attempt 和预期旧指针的新 building generation。
     """
+    if lease and lease.library_id != library_id:
+        raise PublicationError("job_generation_mismatch")
     async with database.transaction() as session:
         library = await session.scalar(
             select(Library).where(Library.library_id == library_id).with_for_update()
         )
         if library is None:
             raise PublicationError("library_missing")
+        if lease is None and await session.scalar(
+            select(BuildIntent.build_intent_id)
+            .where(BuildIntent.library_id == library_id, BuildIntent.state == "running")
+            .limit(1)
+        ):
+            raise PublicationError("job_lease_required")
+        job = await check_index_lease(session, lease) if lease else None
+        if lease and (
+            lease.library_id != library_id
+            or lease.membership_revision != library.membership_revision
+        ):
+            raise PublicationError("membership_changed")
+        if job and job.generation_id is not None:
+            raise PublicationError("job_attempt_already_reserved")
         if library.building_generation_id is not None:
             raise PublicationError("library_build_in_progress")
-        identity, attempt = uuid4(), uuid4()
+        identity, attempt = uuid4(), lease.attempt_id if lease else uuid4()
         generation = IndexGeneration(
             generation_id=identity,
             library_id=library_id,
@@ -81,10 +101,12 @@ async def reserve_generation(database, library_id: UUID) -> IndexGeneration:
         session.add(generation)
         await session.flush()
         library.building_generation_id = identity
+        if job:
+            job.generation_id, job.stage = identity, "reserved"
         return generation
 
 
-async def save_built_index(database, generation, built: BuiltIndex) -> None:
+async def save_built_index(database, generation, built: BuiltIndex, *, lease=None) -> None:
     """名称：保存冻结清单。用途：核验身份后持久化 chunk，不执行发布。
 
     Args:
@@ -98,6 +120,7 @@ async def save_built_index(database, generation, built: BuiltIndex) -> None:
         library = await session.scalar(
             select(Library).where(Library.library_id == generation.library_id).with_for_update()
         )
+        await _check_generation_lease(session, lease, generation)
         current = await session.get(IndexGeneration, generation.generation_id, with_for_update=True)
         _check_current(library, current, generation)
         if current.manifest or built.manifest["attempt_id"] != str(current.attempt_id):
@@ -130,8 +153,35 @@ def _check_current(library, current, generation) -> None:
         raise PublicationError("build_attempt_mismatch")
 
 
+def _check_job_generation(job, generation):
+    """检查 Job 与 generation 绑定，不能借有效租约修改其他 attempt。"""
+    if job and (
+        job.generation_id != generation.generation_id
+        or job.attempt_id != generation.attempt_id
+        or job.library_id != generation.library_id
+    ):
+        raise PublicationError("job_generation_mismatch")
+
+
+async def _check_generation_lease(session, lease, generation, *, allow_cancel=False):
+    """C1 兼容调用不能绕过 Job 所属 generation 的 fencing 核验。"""
+    if lease and lease.library_id != generation.library_id:
+        raise PublicationError("job_generation_mismatch")
+    if lease is None:
+        if await session.scalar(
+            select(BuildIntent.build_intent_id)
+            .where(BuildIntent.generation_id == generation.generation_id)
+            .limit(1)
+        ):
+            raise PublicationError("job_lease_required")
+        return None
+    job = await check_index_lease(session, lease, allow_cancel=allow_cancel)
+    _check_job_generation(job, generation)
+    return job
+
+
 async def publish_generation(
-    database, generation, built: BuiltIndex, qdrant, verify_sources
+    database, generation, built: BuiltIndex, qdrant, verify_sources, *, lease=None
 ) -> dict:
     """名称：校验并发布。用途：完整外部核验后在短事务原子切换指针。
 
@@ -146,11 +196,21 @@ async def publish_generation(
     """
     _check_manifest(generation, built)
     await verify_sources()
-    evidence = qdrant.verify(generation.collection_name, built.points)
+    verification = asyncio.create_task(
+        asyncio.to_thread(qdrant.verify, generation.collection_name, built.points)
+    )
+    try:
+        evidence = await asyncio.shield(verification)
+    except asyncio.CancelledError:
+        # 正在进行的有限网络读取结束后才释放本进程客户端，绝不继续发布。
+        with suppress(Exception):
+            await verification
+        raise
     async with database.transaction() as session:
         library = await session.scalar(
             select(Library).where(Library.library_id == generation.library_id).with_for_update()
         )
+        job = await _check_generation_lease(session, lease, generation)
         current = await session.get(IndexGeneration, generation.generation_id, with_for_update=True)
         _check_current(library, current, generation)
         if library.membership_revision != current.membership_revision:
@@ -200,10 +260,13 @@ async def publish_generation(
         current.published_at = datetime.now(timezone.utc)
         library.active_generation_id = current.generation_id
         library.building_generation_id = None
+        if job:
+            # 发布指针与任务成功必须同事务提交，响应丢失不能重新发布。
+            job.state, job.stage, job.error_code = "succeeded", "finished", None
     return evidence
 
 
-async def fail_generation(database, generation, error_code: str) -> None:
+async def fail_generation(database, generation, error_code: str, *, lease=None) -> None:
     """名称：记录构建失败。用途：仅释放同 attempt 的构建指针，保留旧活动代。
 
     Args:
@@ -216,6 +279,7 @@ async def fail_generation(database, generation, error_code: str) -> None:
         library = await session.scalar(
             select(Library).where(Library.library_id == generation.library_id).with_for_update()
         )
+        await _check_generation_lease(session, lease, generation, allow_cancel=True)
         current = await session.get(IndexGeneration, generation.generation_id, with_for_update=True)
         _check_current(library, current, generation)
         current.state = "failed"

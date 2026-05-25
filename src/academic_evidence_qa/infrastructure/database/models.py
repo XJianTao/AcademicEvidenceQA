@@ -172,7 +172,7 @@ class LibraryPaper(Base):
 
 
 class BuildIntent(Base):
-    """待构建意图
+    """名称：持久化索引任务。用途：保留成员变更意图并执行租约构建。
 
     保证成员变化不会仅保留在内存。
 
@@ -180,15 +180,31 @@ class BuildIntent(Base):
         library_id, membership_revision: 实际成员修改后的库与修订，联合唯一。
         build_intent_id: 默认生成 UUID；created_at 由数据库记录。
     Returns:
-        与成员/修订同事务提交的记录，M1-C 才接入领取/合并/执行。
+        与成员/修订同事务提交的 Job，C2 原地扩展，不另建队列。
     """
 
     __tablename__ = "build_intents"
     __table_args__ = (
         UniqueConstraint("library_id", "membership_revision", name="uq_intent_library_revision"),
         CheckConstraint("membership_revision > 0", name="ck_intent_revision"),
+        CheckConstraint(
+            "state IN ('queued','running','succeeded','failed','cancelled')",
+            name="ck_index_job_state",
+        ),
+        CheckConstraint("lease_version >= 0", name="ck_index_job_lease_version"),
     )
     build_intent_id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
+    state: Mapped[str] = mapped_column(String(16), server_default="queued")
+    stage: Mapped[str] = mapped_column(String(32), server_default="queued")
+    cancel_requested: Mapped[bool] = mapped_column(server_default="false")
+    lease_owner: Mapped[str | None] = mapped_column(String(128))
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    lease_version: Mapped[int] = mapped_column(BigInteger, server_default="0")
+    attempt_id: Mapped[UUID | None]
+    generation_id: Mapped[UUID | None] = mapped_column(
+        ForeignKey("index_generations.generation_id", name="fk_job_generation")
+    )
+    error_code: Mapped[str | None] = mapped_column(String(128))
     library_id: Mapped[UUID] = mapped_column(ForeignKey("libraries.library_id"))
     membership_revision: Mapped[int] = mapped_column(BigInteger)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
