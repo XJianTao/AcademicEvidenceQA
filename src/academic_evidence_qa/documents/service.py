@@ -19,6 +19,7 @@ from typing import BinaryIO
 from uuid import UUID
 
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select, func
 from sqlalchemy.orm import SessionTransactionOrigin
 
 from academic_evidence_qa.contracts.documents import (
@@ -286,6 +287,14 @@ class DocumentService:
             not isinstance(checkpoint, dict) or checkpoint.get("attempt_id") != str(task.attempt_id)
         ):
             raise DocumentError("parse_task_attempt_conflict", 409)
+        if remote_task_id is not None and task.remote_task_id not in (None, remote_task_id):
+            raise DocumentError("attempt_checkpoint_invalid", 409)
+        if (
+            checkpoint is not None
+            and task.checkpoint.get("expires_at") is not None
+            and (checkpoint.get("expires_at") != task.checkpoint["expires_at"])
+        ):
+            raise DocumentError("attempt_checkpoint_invalid", 409)
         # 取消也保留已经取得的远端身份和原 attempt 期限，便于诊断；
         # 这里只冻结已知事实，取消状态仍阻止后续远端工作和快照提交。
         if remote_task_id is not None:
@@ -294,6 +303,9 @@ class DocumentService:
             task.checkpoint = checkpoint
         if task.cancel_requested:
             task.state, task.stage = "cancelled", "cancelled"
+            task.error_code = (
+                "remote_cancellation_unknown" if task.remote_task_id else "parse_task_cancelled"
+            )
         else:
             task.stage = stage
         task.updated_at = datetime.now(timezone.utc)
@@ -410,6 +422,7 @@ class DocumentService:
                 expected_sha256=snapshot.normalized_artifact_sha256,
             )
         task.state, task.stage, task.error_code = "completed", "completed", None
+        task.parse_snapshot_id = snapshot.parse_snapshot_id
         task.updated_at = datetime.now(timezone.utc)
         await session.flush()
         return snapshot.parse_snapshot_id
@@ -576,6 +589,10 @@ class DocumentService:
             raise DocumentError("parse_task_not_found", 404)
         if task.state != "executing" or task.executor_token != executor_token:
             raise DocumentError("parse_task_executor_conflict", 409)
+        if task.lease_expires_at is not None:
+            now = await session.scalar(select(func.clock_timestamp()))
+            if task.lease_expires_at <= now:
+                raise DocumentError("parse_task_lease_expired", 409)
         return task
 
     @staticmethod

@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import asyncio
+import math
 import re
 import time
 from collections.abc import Awaitable, Callable
@@ -239,6 +240,41 @@ class MineruClient:
         )
         raise MineruClientError("attempt_resume_unsupported", attempt=rejected)
 
+    def resume_known_poll(self, *, attempt_id, expires_at, remote_task_id, remaining_seconds):
+        """名称：恢复已上传任务的只读轮询。用途：保留原身份和数据库核验的剩余期限。
+
+        Args:
+            attempt_id, expires_at, remote_task_id: 持久化原检查点，不含 URL。
+            remaining_seconds: 数据库时钟剩余预算，调用方已扣除查询到此处的耗时。
+        Returns:
+            仅能轮询/下载的上下文，不允许提交或上传；失败重试预算必须为零。
+        """
+        self._require_open()
+        if (
+            not _valid_identifier(attempt_id)
+            or not _valid_identifier(remote_task_id)
+            or expires_at.tzinfo is None
+            or self.config.max_retries != 0
+        ):
+            raise MineruClientError("attempt_checkpoint_invalid")
+        if (
+            not math.isfinite(remaining_seconds)
+            or remaining_seconds <= 0
+            or remaining_seconds > self.config.total_timeout_seconds
+            or attempt_id in self._started_attempt_ids
+        ):
+            raise MineruClientError("remote_total_timeout")
+        self._started_attempt_ids.add(attempt_id)
+        return MineruAttempt(
+            attempt_id,
+            expires_at,
+            self._monotonic() + remaining_seconds,
+            self._attempt_owner,
+            remote_task_id,
+            "poll",
+            "known",
+        )
+
     async def submit(
         self,
         source: Path,
@@ -300,7 +336,10 @@ class MineruClient:
         attempt.remote_task_id = batch_id
         attempt.submission_state = "known"
         await self._await_cancellable(
-            lambda: checkpoint_remote_task_id(batch_id), cancellation, attempt=attempt
+            # 已获知的身份必须先落库；取消由检查点事务判断，不能在入口丢掉身份。
+            lambda: checkpoint_remote_task_id(batch_id),
+            None,
+            attempt=attempt,
         )
         return MineruSubmission(batch_id, upload_url)
 

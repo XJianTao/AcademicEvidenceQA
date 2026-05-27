@@ -31,7 +31,9 @@ from academic_evidence_qa.infrastructure.database.models import (
 from academic_evidence_qa.contracts.jobs import IndexJobLease, JobLeaseError
 
 
-async def claim_index_job(database, owner: str, lease_seconds: float, *, library_id=None):
+async def claim_index_job(
+    database, owner: str, lease_seconds: float, *, library_id=None, require_parse_ready=False
+):
     """名称：领取索引任务。用途：短事务跳过锁定库，防止同库并行。
 
     Args:
@@ -73,7 +75,6 @@ async def claim_index_job(database, owner: str, lease_seconds: float, *, library
                 .exists(),
             )
             .order_by(Library.library_id)
-            .limit(1)
             .with_for_update(skip_locked=True)
         )
         # 显式 C1 构建不是可接管租约，跳过其库而非让它饿死其他库。
@@ -99,7 +100,7 @@ async def claim_index_job(database, owner: str, lease_seconds: float, *, library
                 await session.scalars(
                     select(BuildIntent)
                     .where(BuildIntent.library_id == library.library_id)
-                    .order_by(BuildIntent.membership_revision)
+                    .order_by(BuildIntent.membership_revision, BuildIntent.request_sequence)
                     .with_for_update(skip_locked=True)
                 )
             ).all()
@@ -129,6 +130,13 @@ async def claim_index_job(database, owner: str, lease_seconds: float, *, library
                     )
                     job.stage = "finished"
                     continue
+                if require_parse_ready:
+                    readiness = await index_source_readiness(session, library.library_id)
+                    if readiness == "waiting":
+                        continue
+                    if readiness != "ready":
+                        job.state, job.stage, job.error_code = "failed", "finished", readiness
+                        continue
                 job.state, job.stage = "running", "claimed"
                 job.lease_owner = owner
                 job.lease_version += 1
@@ -143,6 +151,51 @@ async def claim_index_job(database, owner: str, lease_seconds: float, *, library
                     job.attempt_id,
                 )
     return None
+
+
+async def index_source_readiness(session, library_id):
+    """名称：索引来源就绪门。用途：所有成员有快照才领取，失败有明确终态。
+
+    Args:
+        session, library_id: 同一 Library 锁下的短事务。
+    Returns:
+        ready/waiting 或稳定缺口码；真正产物完整性仍由 C1 正式读取核验。
+    """
+    members = (
+        await session.scalars(
+            select(LibraryPaper).where(
+                LibraryPaper.library_id == library_id, LibraryPaper.status == "active"
+            )
+        )
+    ).all()
+    waiting = False
+    for member in members:
+        criteria = (
+            ParseSnapshotRecord.document_version_id == member.selected_document_version_id,
+            ParseSnapshotRecord.parser_backend == member.parser_backend,
+            ParseSnapshotRecord.parser_config_id == member.parser_config_id,
+            ParseSnapshotRecord.quality_state.in_(("usable", "usable_with_warnings")),
+        )
+        if await session.scalar(
+            select(ParseSnapshotRecord.parse_snapshot_id).where(*criteria).limit(1)
+        ):
+            continue
+        task = await session.scalar(
+            select(ParseTask)
+            .where(
+                ParseTask.document_version_id == member.selected_document_version_id,
+                ParseTask.parser_backend == member.parser_backend,
+                ParseTask.parser_config_id == member.parser_config_id,
+                ParseTask.library_id == library_id,
+            )
+            .order_by(ParseTask.created_at.desc())
+            .limit(1)
+        )
+        if task and task.state in ("queued", "executing"):
+            waiting = True
+        else:
+            return "parse_dependency_failed" if task else "parse_authorization_or_snapshot_missing"
+    return "waiting" if waiting else "ready"
 
 
 async def check_index_lease(session, lease: IndexJobLease, *, allow_cancel=False):

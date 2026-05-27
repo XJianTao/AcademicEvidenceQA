@@ -1,8 +1,8 @@
-"""模块名称：本地索引 Worker 入口。
+"""模块名称：本地解析与索引 Worker 入口。
 
 用途：组装已有存储与单 owner 模型，周期领取索引意图。
 核心设计：一次只执行一个 Job，postgres 是唯一权威。
-工程要点：不启动 API、不上传 PDF；退出保留租约供超时接管。
+工程要点：不启动 API；显式 --with-parsing 启用获准外发，退出保留租约供安全接管。
 """
 
 import argparse
@@ -23,6 +23,7 @@ from academic_evidence_qa.infrastructure.model_runtime import (
     DEFAULT_RERANKER_PATH,
 )
 from academic_evidence_qa.ingestion.job_runner import IndexJobRunner
+from academic_evidence_qa.ingestion.parse_runner import ParseJobRunner
 
 
 def argument_parser():
@@ -46,6 +47,11 @@ def argument_parser():
     parser.add_argument("--reranker-path", type=Path, default=DEFAULT_RERANKER_PATH)
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--once", action="store_true")
+    parser.add_argument(
+        "--with-parsing",
+        action="store_true",
+        help="M1-C3 正式导入调度；CLI 索引验证默认保持 C2 语义",
+    )
     return parser
 
 
@@ -64,9 +70,17 @@ async def run(args, *, once=False):
     database = Database(settings.database_url.set(database=args.database_name))
     qdrant = QdrantStore(args.qdrant_url)
     try:
+        store = LocalFileStore(args.data_root)
+        parse_runner = ParseJobRunner(
+            database,
+            store,
+            settings,
+            lease_seconds=args.lease_seconds,
+            heartbeat_seconds=args.heartbeat_seconds,
+        )
         runner = IndexJobRunner(
             database,
-            LocalFileStore(args.data_root),
+            store,
             qdrant,
             owner=args.owner,
             lease_seconds=args.lease_seconds,
@@ -75,8 +89,13 @@ async def run(args, *, once=False):
             reranker_path=args.reranker_path,
             batch_size=args.batch_size,
             max_json_bytes=settings.result_max_json_bytes,
+            require_parse_ready=args.with_parsing,
         )
         while True:
+            if args.with_parsing:
+                parsed = await parse_runner.run_once(library_id=args.library_id)
+                if parsed is not None:
+                    print(json.dumps(parsed, ensure_ascii=False))
             result = await runner.run_once(library_id=args.library_id)
             if once or args.once:
                 return result

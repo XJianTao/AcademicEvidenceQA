@@ -39,6 +39,7 @@ class IndexJobRunner:
         owner,
         lease_seconds=60,
         heartbeat_seconds=10,
+        require_parse_ready=False,
         **pipeline_options,
     ):
         if (
@@ -55,6 +56,7 @@ class IndexJobRunner:
             heartbeat_seconds,
         )
         self.pipeline_options = pipeline_options
+        self.require_parse_ready = require_parse_ready
         self._running = False
 
     async def run_once(self, *, library_id=None):
@@ -70,7 +72,11 @@ class IndexJobRunner:
         self._running = True
         try:
             lease = await claim_index_job(
-                self.database, self.owner, self.lease_seconds, library_id=library_id
+                self.database,
+                self.owner,
+                self.lease_seconds,
+                library_id=library_id,
+                require_parse_ready=self.require_parse_ready,
             )
             if lease is None:
                 return None

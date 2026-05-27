@@ -27,6 +27,7 @@ from alembic.config import Config
 from psycopg.rows import dict_row
 from sqlalchemy import create_engine
 
+from academic_evidence_qa.ingestion.parse_runner import execute_parse_flow
 from academic_evidence_qa.config import Settings, load_settings
 from academic_evidence_qa.contracts.documents import DocumentError, ParserSelection
 from academic_evidence_qa.contracts.jobs import ParseTaskRequest
@@ -341,110 +342,35 @@ async def run_validation(args, summary: dict) -> int:
         watcher = asyncio.create_task(
             observe_cancellation(database, job_id, remote_cancel, local_cancel)
         )
-        source = store.data_root / stored.object_key
-        stage = "submit"
-        async with record_stage(summary, stage):
-            await checkpoint()
-            submission = await client.submit(
-                source,
-                attempt=attempt,
-                checkpoint_remote_task_id=checkpoint,
-                cancellation=remote_cancel,
-            )
-        for stage in ("upload", "poll", "download"):
-            async with record_stage(summary, stage):
-                await checkpoint()
-                if stage == "upload":
-                    await client.upload(
-                        source, submission, attempt=attempt, cancellation=remote_cancel
-                    )
-                elif stage == "poll":
-                    completed = await client.wait_for_completion(
-                        submission.remote_task_id, attempt=attempt, cancellation=remote_cancel
-                    )
-                    summary.update(
-                        poll_count=completed.poll_count, poll_retries=completed.retry_count
-                    )
-                else:
-                    await client.download(
-                        completed,
-                        attempt_dir / "result.zip",
-                        attempt=attempt,
-                        cancellation=remote_cancel,
-                    )
-        guard = CancellableValidationGuard(local_cancel)
-        stage = "extract"
-        async with record_stage(summary, stage):
-            await checkpoint()
-            extracted = await asyncio.to_thread(
-                extract_result_archive,
-                attempt_dir / "result.zip",
-                attempt_dir / "extracted",
-                max_files=settings.result_max_files,
-                max_extracted_bytes=settings.result_max_extracted_bytes,
-                max_json_bytes=settings.result_max_json_bytes,
-                timeout_seconds=settings.result_extract_timeout_seconds,
-                memory_mib=settings.result_extract_memory_mib,
-                guard=guard,
-            )
-            summary["archive"] = vars(extracted)
-        content_lists = list((attempt_dir / "extracted").rglob("*_content_list.json"))
-        if len(content_lists) != 1:
-            raise ParserError("mineru_content_list_ambiguous_or_missing")
-        stage = "normalize"
-        async with record_stage(summary, stage):
-            await checkpoint()
-            normalized_path = attempt_dir / "normalized.json"
-            document = await asyncio.to_thread(
-                normalize_mineru_result,
-                content_lists[0],
-                normalized_path,
-                max_json_bytes=settings.result_max_json_bytes,
-                timeout_seconds=settings.normalization_timeout_seconds,
-                memory_mib=settings.normalization_memory_mib,
-                guard=guard,
-            )
-            summary.update(
-                quality_state=document.quality_state,
-                quality_metrics=document.quality_metrics,
-                warning_count=document.quality_metrics.get("warning_count", 0),
-            )
-            if document.quality_state == "rejected" or not document.blocks:
-                raise ParserError("parser_quality_rejected")
-        stage = "artifacts"
-        async with record_stage(summary, stage):
-            await checkpoint()
-            with (attempt_dir / "result.zip").open("rb") as stream:
-                raw = await asyncio.to_thread(
-                    store.write_artifact,
-                    "mineru_raw",
-                    stream,
-                    max_bytes=settings.result_max_download_bytes,
-                )
-            with normalized_path.open("rb") as stream:
-                normalized = await asyncio.to_thread(
-                    store.write_artifact,
-                    "normalized",
-                    stream,
-                    max_bytes=settings.result_max_json_bytes,
-                )
-            summary.update(raw_artifact=vars(raw), normalized_artifact=vars(normalized))
-        stage = "snapshot_commit"
-        async with record_stage(summary, stage):
-            await checkpoint()
-            async with database.transaction() as session:
-                snapshot_id = await service.save_parse_snapshot(
-                    session,
-                    parse_task_id=job_id,
-                    executor_token=executor_token,
-                    document=document,
-                    adapter_version=ADAPTER_VERSION,
-                    remote_version="unknown",
-                    actual_resource_config=config_identity,
-                    raw_artifact=raw,
-                    normalized_artifact=normalized,
-                )
-            summary["parse_snapshot_id"] = str(snapshot_id)
+        context = {"stage": "submit"}
+
+        async def shared_checkpoint(remote_task_id=None):
+            nonlocal stage
+            stage = context["stage"]
+            await checkpoint(remote_task_id)
+
+        snapshot_id, document, raw, normalized = await execute_parse_flow(
+            database=database,
+            service=service,
+            store=store,
+            stored=stored,
+            settings=settings,
+            client=client,
+            attempt=attempt,
+            job_id=job_id,
+            executor_token=executor_token,
+            attempt_dir=attempt_dir,
+            checkpoint=shared_checkpoint,
+            local_cancel=local_cancel,
+            remote_cancel=remote_cancel,
+            summary=summary,
+            config_identity=config_identity,
+            context=context,
+            record_stage=record_stage,
+            guard_factory=CancellableValidationGuard,
+            extract=extract_result_archive,
+            normalize=normalize_mineru_result,
+        )
         stage = "independent_verify"
         async with record_stage(summary, stage):
             summary["database_verification"] = await asyncio.to_thread(

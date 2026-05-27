@@ -4,6 +4,10 @@ version = "0.1.0"
 description = "AcademicEvidenceQA M0 reproducibility and feasibility checks"
 requires-python = ">=3.12,<3.13"
 dependencies = [
+  "fastapi==0.115.12",
+  "pydantic==2.11.7",
+  "uvicorn==0.34.3",
+  "python-multipart==0.0.20",
   "sqlalchemy==2.0.44",
   "alembic==1.17.1",
   "psycopg[binary]==3.2.12",

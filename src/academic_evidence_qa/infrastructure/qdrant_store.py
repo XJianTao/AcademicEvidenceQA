@@ -6,6 +6,7 @@
 """
 
 import math
+from urllib.parse import urlsplit
 
 from qdrant_client import QdrantClient, models
 
@@ -24,7 +25,10 @@ class QdrantStore:
     """
 
     def __init__(self, url: str):
-        self.client = QdrantClient(url=url, timeout=30)
+        # Windows 系统代理也会被 httpx 自动读取；本机服务必须直连，
+        # 避免 loopback 被转发到代理。仅改变本客户端，不修改全局代理。
+        loopback = urlsplit(url).hostname in {"127.0.0.1", "localhost", "::1"}
+        self.client = QdrantClient(url=url, timeout=30, trust_env=not loopback)
 
     def create(self, collection: str) -> None:
         """名称：创建暂存集合。用途：拒绝已有集合，避免覆盖任何历史证据。"""

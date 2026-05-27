@@ -32,6 +32,17 @@ class Base(DeclarativeBase):
     """本阶段实体的声明基类，仅用于类型化映射与迁移比较。"""
 
 
+class ManagementRequest(Base):
+    """名称：管理幂等记录。用途：请求与结果同事务冻结，重放先于修订核验。"""
+
+    __tablename__ = "management_requests"
+    idempotency_key: Mapped[str] = mapped_column(String(128), primary_key=True)
+    request_sha256: Mapped[str] = mapped_column(String(64))
+    response_status: Mapped[int]
+    response_body: Mapped[dict] = mapped_column(JSON)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
 class Library(Base):
     """论文库
 
@@ -185,8 +196,13 @@ class BuildIntent(Base):
 
     __tablename__ = "build_intents"
     __table_args__ = (
-        UniqueConstraint("library_id", "membership_revision", name="uq_intent_library_revision"),
-        CheckConstraint("membership_revision > 0", name="ck_intent_revision"),
+        UniqueConstraint(
+            "library_id",
+            "membership_revision",
+            "request_sequence",
+            name="uq_intent_library_revision",
+        ),
+        CheckConstraint("membership_revision >= 0", name="ck_intent_revision"),
         CheckConstraint(
             "state IN ('queued','running','succeeded','failed','cancelled')",
             name="ck_index_job_state",
@@ -207,13 +223,17 @@ class BuildIntent(Base):
     error_code: Mapped[str | None] = mapped_column(String(128))
     library_id: Mapped[UUID] = mapped_column(ForeignKey("libraries.library_id"))
     membership_revision: Mapped[int] = mapped_column(BigInteger)
+    request_sequence: Mapped[int] = mapped_column(BigInteger, server_default="0")
+    retry_of_job_id: Mapped[UUID | None] = mapped_column(
+        ForeignKey("build_intents.build_intent_id")
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
 class ParseTask(Base):
     """最小解析任务
 
-    保存单次显式执行的远端标识、取消请求和失败诊断，不实现租约或队列领取。
+    保存固定 attempt、远端标识与失败诊断；C3 增加数据库时钟租约及安全队列领取。
 
     Args:
         document_version_id: 固定输入版本，任务不会随成员选版变化。
@@ -224,6 +244,7 @@ class ParseTask(Base):
     """
 
     __tablename__ = "parse_tasks"
+    index_job_id: Mapped[UUID | None] = mapped_column(ForeignKey("build_intents.build_intent_id"))
     __table_args__ = (
         CheckConstraint(
             "state IN ('queued', 'executing', 'failed', 'cancelled', 'completed')",
@@ -243,6 +264,12 @@ class ParseTask(Base):
     stage: Mapped[str] = mapped_column(String(64), server_default="accepted")
     attempt_id: Mapped[UUID] = mapped_column(default=uuid4)
     executor_token: Mapped[UUID | None]
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    library_id: Mapped[UUID | None] = mapped_column(ForeignKey("libraries.library_id"))
+    retry_of_job_id: Mapped[UUID | None] = mapped_column(ForeignKey("parse_tasks.parse_task_id"))
+    parse_snapshot_id: Mapped[UUID | None] = mapped_column(
+        ForeignKey("parse_snapshots.parse_snapshot_id")
+    )
     cancel_requested: Mapped[bool] = mapped_column(server_default="false")
     remote_task_id: Mapped[str | None] = mapped_column(String(512))
     error_code: Mapped[str | None] = mapped_column(String(128))
