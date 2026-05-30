@@ -1,8 +1,8 @@
 """模块名称：本地管理 API 生命周期。
 
 用途：FastAPI 工厂和原生 loopback 服务入口。
-核心设计：API 只持有轻量存储，所有执行在独立持久 Worker。
-工程要点：统一脱敏错误，不在公网监听，不加载解析器/模型。
+核心设计：单进程 API 持有模型 owner，解析与构建仍在独立持久 Worker。
+工程要点：统一脱敏错误；loopback 内部推理有界，测试可显式关闭模型。
 """
 
 import argparse
@@ -17,6 +17,9 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
 from academic_evidence_qa.api.routes import router
+from academic_evidence_qa.api.routes import internal_router, retrieval_router
+from academic_evidence_qa.bootstrap import initialize_retrieval, close_retrieval
+from academic_evidence_qa.infrastructure.inference_executor import RuntimeErrorCode
 from academic_evidence_qa.config import load_settings
 from academic_evidence_qa.contracts.documents import DocumentError
 from academic_evidence_qa.documents.parser import ParserError
@@ -29,7 +32,7 @@ from academic_evidence_qa.infrastructure.database.session import (
 from academic_evidence_qa.infrastructure.local_file_store import LocalFileStore
 
 
-def create_app(settings=None, *, database=None, store=None):
+def create_app(settings=None, *, database=None, store=None, with_models=None):
     """名称：API 工厂。用途：注入配置与组件，不连接远端或加载模型。
 
     Args:
@@ -40,20 +43,32 @@ def create_app(settings=None, *, database=None, store=None):
     """
     settings = settings or load_settings()
     owned = database is None
+    with_models = owned if with_models is None else with_models
     database = database or Database(settings.database_url)
     store = store or LocalFileStore(settings.data_root)
 
     @asynccontextmanager
     async def lifespan(app):
         try:
+            if with_models:
+                await initialize_retrieval(app)
             yield
         finally:
+            if with_models and getattr(app.state, "runtime", None) is not None:
+                await close_retrieval(app)
             if owned:
                 await database.close()
 
     app = FastAPI(title="AcademicEvidenceQA 本地管理", lifespan=lifespan)
     app.state.settings, app.state.database, app.state.store = settings, database, store
     app.state.management = ManagementService(database, store, settings)
+    app.state.retrieval = None
+
+    @app.exception_handler(RuntimeErrorCode)
+    async def runtime_error(request, error):
+        return JSONResponse(
+            {"error_code": str(error)}, status_code=429 if str(error) == "executor_busy" else 503
+        )
 
     @app.exception_handler(DocumentError)
     async def document_error(request, error):
@@ -85,6 +100,8 @@ def create_app(settings=None, *, database=None, store=None):
         return JSONResponse({"error_code": "service_unavailable"}, status_code=503)
 
     app.include_router(router)
+    app.include_router(internal_router)
+    app.include_router(retrieval_router)
     return app
 
 

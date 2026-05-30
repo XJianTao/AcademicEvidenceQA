@@ -13,6 +13,64 @@ from academic_evidence_qa.documents.parser import ADAPTER_VERSION
 from academic_evidence_qa.infrastructure.mineru_client import MineruClientConfig
 
 
+async def initialize_retrieval(app):
+    """名称：组装模型与检索。用途：API 生命周期内唯一 owner，冷启动不阻塞事件循环。
+
+    Args:
+        app: 已组装数据库、存储及配置的应用。
+    Returns:
+        None；资源写入 state，由对应关闭函数释放。
+    """
+    from academic_evidence_qa.infrastructure.inference_executor import BoundedExecutor
+    from academic_evidence_qa.infrastructure.model_runtime import (
+        ModelRuntime,
+        DEFAULT_BGE_PATH,
+        DEFAULT_RERANKER_PATH,
+    )
+    from academic_evidence_qa.infrastructure.qdrant_store import QdrantStore
+    from academic_evidence_qa.retrieval.pipeline import RetrievalPipeline
+    from pathlib import Path
+    import time
+
+    state = app.state
+    state.inference = BoundedExecutor(state.settings.inference_queue_capacity)
+    state.source_io = BoundedExecutor(4)
+    started = time.monotonic()
+    try:
+        state.runtime, _ = await state.inference.run(
+            lambda: ModelRuntime(
+                Path(os.getenv("BGE_M3_MODEL_PATH", str(DEFAULT_BGE_PATH))),
+                Path(os.getenv("RERANKER_MODEL_PATH", str(DEFAULT_RERANKER_PATH))),
+                with_reranker=True,
+            ),
+            total_seconds=300,
+        )
+        state.model_load_seconds = time.monotonic() - started
+        state.qdrant = QdrantStore(state.settings.qdrant_url)
+        state.retrieval = RetrievalPipeline(
+            state.database,
+            state.store,
+            state.qdrant,
+            state.runtime,
+            state.inference,
+            state.source_io,
+            max_json_bytes=state.settings.result_max_json_bytes,
+        )
+    except BaseException:
+        await state.inference.close()
+        await state.source_io.close()
+        raise
+
+
+async def close_retrieval(app):
+    """先等所有同步推理与来源读结束，再关闭连接及释放本生命周期权重。"""
+    await app.state.inference.close()
+    await app.state.source_io.close()
+    app.state.qdrant.close()
+    app.state.retrieval = None
+    app.state.runtime = None
+
+
 def parser_identity(settings):
     """名称：解析配置身份。用途：API、Worker 和缓存使用相同不可变配置。
 

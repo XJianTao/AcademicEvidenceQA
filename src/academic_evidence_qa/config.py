@@ -54,6 +54,9 @@ class Settings:
     normalization_memory_mib: int = 2048
     local_parser_concurrency: int = 1
     parser_queue_capacity: int = 2
+    model_api_url: str = "http://127.0.0.1:8000"
+    qdrant_url: str = "http://127.0.0.1:56333"
+    inference_queue_capacity: int = 4
 
 
 def load_settings() -> Settings:
@@ -116,4 +119,7 @@ def load_settings() -> Settings:
         normalization_memory_mib=positive_int("NORMALIZATION_MEMORY_MIB", 2048),
         local_parser_concurrency=positive_int("LOCAL_PARSER_CONCURRENCY", 1),
         parser_queue_capacity=positive_int("PARSER_QUEUE_CAPACITY", 2),
+        model_api_url=os.getenv("MODEL_API_URL", "http://127.0.0.1:8000"),
+        qdrant_url=os.getenv("QDRANT_URL", "http://127.0.0.1:56333"),
+        inference_queue_capacity=positive_int("INFERENCE_QUEUE_CAPACITY", 4),
     )

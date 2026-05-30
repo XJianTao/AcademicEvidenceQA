@@ -74,6 +74,7 @@ async def rebuild_library(
 
     await check("reserve")
     generation = await reserve_generation(database, library_id, lease=lease)
+    runtime = None
     try:
         await check("sources")
         async with database.sessions() as session:
@@ -167,3 +168,7 @@ async def rebuild_library(
             # 数据库不可用时不掩盖原故障；本轮不提供自动恢复，构建指针保留供诊断。
             error.add_note("generation_failure_record_unavailable")
         raise
+    finally:
+        # HTTP runtime 的生命周期归本次构建；显式串行 CLI owner 无 close，保持其复用。
+        if runtime is not None and hasattr(runtime, "close"):
+            await threaded(runtime.close)

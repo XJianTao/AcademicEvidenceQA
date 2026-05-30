@@ -35,7 +35,11 @@ include = ["academic_evidence_qa*"]
 "" = "src"
 
 [dependency-groups]
-dev = ["pytest==8.4.2", "ruff==0.14.3"]
+dev = [
+    "mypy==1.18.2",
+    "pytest==8.4.2",
+    "ruff==0.14.3",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -44,3 +48,9 @@ pythonpath = ["src"]
 [tool.ruff]
 line-length = 100
 target-version = "py312"
+
+[tool.mypy]
+files = ["src/academic_evidence_qa/contracts/rag.py", "src/academic_evidence_qa/infrastructure/embedding_client.py"]
+follow_imports = "skip"
+ignore_missing_imports = true
+check_untyped_defs = true

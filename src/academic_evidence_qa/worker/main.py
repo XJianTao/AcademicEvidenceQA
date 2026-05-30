@@ -8,6 +8,7 @@
 import argparse
 import asyncio
 import json
+import os
 from pathlib import Path
 from uuid import UUID, uuid4
 
@@ -42,10 +43,17 @@ def argument_parser():
     parser.add_argument("--lease-seconds", type=float, default=60)
     parser.add_argument("--heartbeat-seconds", type=float, default=10)
     parser.add_argument("--poll-seconds", type=float, default=2)
-    parser.add_argument("--qdrant-url", default="http://127.0.0.1:56333")
-    parser.add_argument("--model-path", type=Path, default=DEFAULT_BGE_PATH)
-    parser.add_argument("--reranker-path", type=Path, default=DEFAULT_RERANKER_PATH)
+    parser.add_argument("--qdrant-url", default=os.getenv("QDRANT_URL", "http://127.0.0.1:56333"))
+    parser.add_argument(
+        "--model-path", type=Path, default=os.getenv("BGE_M3_MODEL_PATH", str(DEFAULT_BGE_PATH))
+    )
+    parser.add_argument(
+        "--reranker-path",
+        type=Path,
+        default=os.getenv("RERANKER_MODEL_PATH", str(DEFAULT_RERANKER_PATH)),
+    )
     parser.add_argument("--batch-size", type=int, default=4)
+    parser.add_argument("--model-api-url", default=None)
     parser.add_argument("--once", action="store_true")
     parser.add_argument(
         "--with-parsing",
@@ -67,6 +75,12 @@ async def run(args, *, once=False):
     if args.poll_seconds <= 0 or args.batch_size < 1:
         raise ValueError("invalid_worker_config")
     settings = load_settings()
+    from functools import partial
+    from academic_evidence_qa.infrastructure.embedding_client import EmbeddingClient
+
+    runtime_factory = partial(
+        EmbeddingClient, base_url=args.model_api_url or settings.model_api_url
+    )
     database = Database(settings.database_url.set(database=args.database_name))
     qdrant = QdrantStore(args.qdrant_url)
     try:
@@ -90,6 +104,7 @@ async def run(args, *, once=False):
             batch_size=args.batch_size,
             max_json_bytes=settings.result_max_json_bytes,
             require_parse_ready=args.with_parsing,
+            runtime_factory=runtime_factory,
         )
         while True:
             if args.with_parsing:

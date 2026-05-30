@@ -186,3 +186,11 @@ class SourceResponse(StrictResponse):
     items: list[SourceItemResponse]
     next_offset: int | None
     next_char_offset: int | None = None
+
+
+class EncodingRequest(BaseModel):
+    """内部编码只接受小批次；总字节预算由路由在 JSON 解码前核验。"""
+
+    model_config = ConfigDict(extra="forbid")
+    texts: list[str] = Field(min_length=1, max_length=4)
+    configuration_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")

@@ -2,7 +2,7 @@
 
 用途：将严格 HTTP 契约转换到正式服务，不承载业务或后台任务。
 核心设计：流式接收/受限预检在事务外，受理由持久服务原子完成。
-工程要点：不提供路径输入、不加载模型、不打印第三方消息。
+工程要点：不提供路径输入，模型由生命周期持有；不打印第三方消息。
 """
 
 import asyncio
@@ -34,6 +34,91 @@ from academic_evidence_qa.documents.source_reader import read_scoped_source
 from academic_evidence_qa.documents.upload import preflight_and_store_pdf, _remove_upload_directory
 
 router = APIRouter(prefix="/v1")
+internal_router = APIRouter(prefix="/internal")
+retrieval_router = APIRouter(prefix="/v1")
+
+
+async def bounded_json(request, limit):
+    """逐段统计实际字节，在 JSON/Pydantic 解码前拒绝过大的请求。"""
+    import json
+
+    data = bytearray()
+    async for part in request.stream():
+        if len(data) + len(part) > limit:
+            raise DocumentError("request_body_too_large", 413)
+        data.extend(part)
+    try:
+        return json.loads(data)
+    except (ValueError, UnicodeError) as error:
+        raise DocumentError("request_invalid", 422) from error
+
+
+def require_runtime(request, *, internal=False):
+    if internal and (request.client is None or request.client.host not in {"127.0.0.1", "::1"}):
+        raise DocumentError("internal_endpoint_forbidden", 403)
+    if request.app.state.retrieval is None:
+        raise DocumentError("model_owner_unavailable", 503)
+    return request.app.state
+
+
+@internal_router.get("/models")
+async def model_metadata(request: Request):
+    import os
+
+    state = require_runtime(request, internal=True)
+    return {
+        "identity": state.runtime.identity,
+        "reranker_identity": state.runtime.reranker_identity,
+        "device": state.runtime.device,
+        "dtype": str(state.runtime.dtype),
+        "model_load_seconds": state.model_load_seconds,
+        "process_id": os.getpid(),
+        "inference_active": state.inference.active,
+        "inference_queued": len(state.inference.queue),
+    }
+
+
+@internal_router.post("/encode")
+async def encode_batch(request: Request):
+    """名称：受限内部编码。用途：Worker 复用 owner；身份不匹配不进入推理。
+
+    Args:
+        request: loopback 小 JSON，最多四条且每条不超过 600 tokens。
+    Returns:
+        向量、原配置身份与排队/推理耗时，不建立公共推理服务。
+    """
+    from academic_evidence_qa.api.schemas import EncodingRequest
+
+    state = require_runtime(request, internal=True)
+    try:
+        body = EncodingRequest.model_validate(await bounded_json(request, 64 * 1024))
+    except ValidationError as error:
+        raise DocumentError("request_invalid", 422) from error
+    if body.configuration_sha256 != state.runtime.identity["configuration_sha256"]:
+        raise DocumentError("embedding_identity_mismatch", 409)
+    if any(not text or len(text) > 16000 for text in body.texts):
+        raise DocumentError("embedding_text_invalid", 422)
+
+    def encode():
+        if any(state.runtime.embedding_length(t) > 600 for t in body.texts):
+            raise DocumentError("embedding_token_limit_exceeded", 422)
+        return state.runtime.encode(body.texts)
+
+    vectors, timing = await state.inference.run(encode)
+    return {"identity": state.runtime.identity, "vectors": vectors, "timings": timing}
+
+
+@retrieval_router.post("/retrieval/candidates")
+async def retrieve_candidates(request: Request):
+    """临时且具名的 Candidate 契约；最终 /retrieve EvidencePack 属于 M2a-2。"""
+    from academic_evidence_qa.contracts.rag import RetrievalRequest
+
+    state = require_runtime(request)
+    try:
+        body = RetrievalRequest.model_validate(await bounded_json(request, 24 * 1024))
+    except ValidationError as error:
+        raise DocumentError("request_invalid", 422) from error
+    return await state.retrieval.retrieve(body)
 
 
 def response(result, schema):

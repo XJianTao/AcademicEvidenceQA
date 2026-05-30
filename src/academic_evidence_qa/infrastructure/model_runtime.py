@@ -1,7 +1,7 @@
 """模块名称：本地 BGE-M3 编码运行时。
 
 用途：进程内单实例加载本地模型，按有界 batch 生成 1024 维归一化 dense。
-核心设计：只加载本机已存在的权重；串行调用，不建立内部服务。
+核心设计：API 唯一 owner；显式串行验证 CLI 可独立加载，不作为 Worker 回退。
 工程要点：实际 tokenizer 长度先于推理检查，不允许静默截断或非有限向量。
 """
 
@@ -13,7 +13,7 @@ import threading
 
 import torch
 from sentence_transformers import SentenceTransformer
-from transformers import AutoTokenizer
+from transformers import AutoTokenizer, AutoModelForSequenceClassification
 
 DEFAULT_BGE_PATH = Path(r"D:\ai_models\modelscope_cache\models\BAAI\bge-m3")
 DEFAULT_RERANKER_PATH = Path(r"D:\ai_models\modelscope_cache\models\rerank\BAAI\bge-reranker-large")
@@ -32,14 +32,17 @@ class ModelRuntime:
     _owner: "ModelRuntime | None" = None
     _owner_lock = threading.Lock()
 
-    def __init__(self, model_path: Path, reranker_path: Path, *, batch_size: int = 4):
+    def __init__(
+        self, model_path: Path, reranker_path: Path, *, batch_size: int = 4, with_reranker=False
+    ):
         if batch_size < 1 or not model_path.is_dir() or not reranker_path.is_dir():
             raise ValueError("local_model_unavailable")
         self.model_path = model_path.resolve()
         self.reranker_path = reranker_path.resolve()
         self.batch_size = batch_size
-        self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        self.dtype = torch.float16 if self.device == "cuda" else torch.float32
+        # 当前验收仅 CPU FP32；不因机器驱动变化静默切换实验条件。
+        self.device = "cpu"
+        self.dtype = torch.float32
         self.model = SentenceTransformer(
             str(self.model_path),
             device=self.device,
@@ -94,6 +97,70 @@ class ModelRuntime:
         self.reranker_tokenizer = AutoTokenizer.from_pretrained(
             str(self.reranker_path), local_files_only=True
         )
+        self.reranker = None
+        self.reranker_identity = {}
+        if with_reranker:
+            self.load_reranker()
+
+    def load_reranker(self):
+        """名称：加载真实重排模型。用途：仅 API owner 生命周期执行，不下载权重。
+
+        Args:
+            无；使用已核验的本地路径及 CPU FP32。
+        Returns:
+            None；身份单独记录，保留旧 embedding manifest 的哈希语义。
+        """
+        if self.reranker is not None:
+            return
+        self.reranker = (
+            AutoModelForSequenceClassification.from_pretrained(
+                str(self.reranker_path), local_files_only=True, dtype=self.dtype
+            )
+            .to(self.device)
+            .eval()
+        )
+        files = {}
+        for path in sorted(self.reranker_path.glob("*.safetensors")) or sorted(
+            self.reranker_path.glob("pytorch_model*.bin")
+        ):
+            with path.open("rb") as stream:
+                files[path.name] = hashlib.file_digest(stream, "sha256").hexdigest()
+        if not files:
+            raise ValueError("reranker_weights_missing")
+        self.reranker_identity = {"files": files, "device": self.device, "dtype": str(self.dtype)}
+
+    def score_pairs(self, pairs: list[tuple[str, str]]) -> list[float]:
+        """名称：真实 pair 打分。用途：核对特殊 token 后的 512 硬限制，不截断。
+
+        Args:
+            pairs: 最多 120 个已分窗 query/passage。
+        Returns:
+            原始相关性 logits，非正确概率。
+        """
+        if self.reranker is None or not 1 <= len(pairs) <= 120:
+            raise ValueError("reranker_unavailable")
+        if any(
+            len(self.reranker_tokenizer(q, p, truncation=False)["input_ids"]) > 512
+            for q, p in pairs
+        ):
+            raise ValueError("reranker_pair_limit_exceeded")
+        scores = []
+        with torch.inference_mode():
+            for start in range(0, len(pairs), self.batch_size):
+                batch = pairs[start : start + self.batch_size]
+                inputs = self.reranker_tokenizer(
+                    [q for q, _ in batch],
+                    [p for _, p in batch],
+                    padding=True,
+                    truncation=False,
+                    return_tensors="pt",
+                ).to(self.device)
+                scores.extend(
+                    float(v) for v in self.reranker(**inputs).logits.flatten().cpu().tolist()
+                )
+        if len(scores) != len(pairs) or not all(math.isfinite(v) for v in scores):
+            raise ValueError("reranker_scores_invalid")
+        return scores
 
     @classmethod
     def owner(cls, model_path: Path, reranker_path: Path, *, batch_size: int = 4) -> "ModelRuntime":

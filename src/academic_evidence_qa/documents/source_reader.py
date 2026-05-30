@@ -124,7 +124,7 @@ async def read_fixed_sources(
     return results
 
 
-async def verify_snapshot(session, version, snapshot, store, *, max_json_bytes):
+async def verify_snapshot(session, version, snapshot, store, *, max_json_bytes, file_executor=None):
     """名称：固定快照完整核验。用途：构建、复用和回源共享同一映射检查。
 
     Args:
@@ -141,20 +141,22 @@ async def verify_snapshot(session, version, snapshot, store, *, max_json_bytes):
     stored = await session.get(StoredFile, version.file_id)
     if stored is None or stored.file_sha256 != version.file_sha256:
         raise SourceError("source_file_identity_invalid")
-    store.verify(
-        StoredObject(stored.file_id, stored.file_sha256, stored.object_key, stored.size_bytes)
-    )
-    store.verify_artifact_reference(
-        snapshot.raw_artifact_key, expected_sha256=snapshot.raw_artifact_sha256
-    )
-    store.verify_artifact_reference(
-        snapshot.normalized_artifact_key,
-        expected_sha256=snapshot.normalized_artifact_sha256,
-    )
-    document = load_normalized_document(
-        store.data_root / snapshot.normalized_artifact_key,
-        max_json_bytes=max_json_bytes,
-    )
+
+    def load_files():
+        store.verify(
+            StoredObject(stored.file_id, stored.file_sha256, stored.object_key, stored.size_bytes)
+        )
+        store.verify_artifact_reference(
+            snapshot.raw_artifact_key, expected_sha256=snapshot.raw_artifact_sha256
+        )
+        store.verify_artifact_reference(
+            snapshot.normalized_artifact_key, expected_sha256=snapshot.normalized_artifact_sha256
+        )
+        return load_normalized_document(
+            store.data_root / snapshot.normalized_artifact_key, max_json_bytes=max_json_bytes
+        )
+
+    document = (await file_executor.run(load_files))[0] if file_executor else load_files()
     if document.quality_state != snapshot.quality_state or not document.blocks:
         raise SourceError("snapshot_integrity_failed")
     payload = json.loads(json.dumps(parsed_document_payload(document)))
