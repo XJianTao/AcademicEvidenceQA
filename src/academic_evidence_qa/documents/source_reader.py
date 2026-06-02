@@ -191,7 +191,9 @@ async def verify_snapshot(session, version, snapshot, store, *, max_json_bytes, 
     return document
 
 
-async def read_scoped_source(database, store, request, *, outline=False, max_json_bytes):
+async def read_scoped_source(
+    database, store, request, *, outline=False, max_json_bytes, file_executor=None
+):
     """名称：有范围的目录/原文读取。用途：固定发布身份或明确未发布预览。
 
     Args:
@@ -260,7 +262,14 @@ async def read_scoped_source(database, store, request, *, outline=False, max_jso
             if content_hash(generation.manifest) != generation.manifest_sha256:
                 raise DocumentError("generation_integrity_failed", 409)
         try:
-            await verify_snapshot(session, version, snapshot, store, max_json_bytes=max_json_bytes)
+            await verify_snapshot(
+                session,
+                version,
+                snapshot,
+                store,
+                max_json_bytes=max_json_bytes,
+                file_executor=file_executor,
+            )
         except Exception as error:
             raise DocumentError("snapshot_integrity_failed", 409) from error
         sections = list(
@@ -393,3 +402,182 @@ async def read_scoped_source(database, store, request, *, outline=False, max_jso
                 break
         await recheck_member()
         return {**base, "items": results, "next_offset": next_offset, "next_char_offset": next_char}
+
+
+async def load_evidence_pack(database, library_id, retrieval_run_id):
+    """名称：加载固定证据封装。用途：核对 registry 与封装哈希，不依赖 Qdrant。
+
+    Args:
+        database, library_id, retrieval_run_id: 显式可信上下文，跨库返回404。
+    Returns:
+        通过持久映射一致性核验的 EvidencePack；尚未替代来源可读性检查。
+    """
+    from academic_evidence_qa.contracts.rag import EvidencePack
+    from academic_evidence_qa.infrastructure.database.models import RetrievalRun, EvidenceRecord
+    from academic_evidence_qa.ingestion.index_builder import content_hash
+
+    async with database.sessions() as session:
+        run = await session.get(RetrievalRun, retrieval_run_id)
+        if run is None or run.library_id != library_id:
+            raise DocumentError("evidence_not_found", 404)
+        if content_hash(run.pack) != run.pack_sha256:
+            raise DocumentError("evidence_integrity_failed", 409)
+        pack = EvidencePack.model_validate(run.pack)
+        if (
+            pack.scope.library_id != library_id
+            or pack.retrieval_run_id != retrieval_run_id
+            or pack.scope.generation_id != run.generation_id
+        ):
+            raise DocumentError("evidence_integrity_failed", 409)
+        rows = (
+            await session.scalars(
+                select(EvidenceRecord).where(EvidenceRecord.retrieval_run_id == retrieval_run_id)
+            )
+        ).all()
+        if {row.evidence_id for row in rows} != {e.evidence_id for e in pack.evidence}:
+            raise DocumentError("evidence_integrity_failed", 409)
+        expected = {e.evidence_id: e.model_dump(mode="json") for e in pack.evidence}
+        if any(
+            content_hash(row.payload) != row.payload_sha256
+            or row.payload != expected[row.evidence_id]
+            for row in rows
+        ):
+            raise DocumentError("evidence_integrity_failed", 409)
+    return pack
+
+
+async def verify_evidence_sources(
+    database, store, pack, *, max_json_bytes, file_executor, cache=None
+):
+    """名称：复用固定证据来源核验。用途：按快照一次装载，逐区间核验来源及位置。
+
+    Args:
+        pack: 已核验 registry 的封装。
+        cache: 仅当前请求的已核验 ParsedDocument，不跨请求缓存来源。
+        max_json_bytes, file_executor: 现有有界读取约束。
+    Returns:
+        None；坏源、范围外三元组及错误原文均硬失败。
+    """
+    cache = {} if cache is None else cache
+    identities = {
+        (m["paper_id"], m["document_version_id"], m["parse_snapshot_id"])
+        for m in pack.scope.members
+    }
+    async with database.sessions() as session:
+        for evidence in pack.evidence:
+            if (
+                str(evidence.paper_id),
+                str(evidence.document_version_id),
+                str(evidence.parse_snapshot_id),
+            ) not in identities:
+                raise DocumentError("evidence_out_of_scope", 409)
+            version = await session.get(DocumentVersion, evidence.document_version_id)
+            snapshot = await session.get(ParseSnapshotRecord, evidence.parse_snapshot_id)
+            if version is None or snapshot is None or version.paper_id != evidence.paper_id:
+                raise DocumentError("evidence_source_invalid", 409)
+            if evidence.parse_snapshot_id not in cache:
+                try:
+                    cache[evidence.parse_snapshot_id] = await verify_snapshot(
+                        session,
+                        version,
+                        snapshot,
+                        store,
+                        max_json_bytes=max_json_bytes,
+                        file_executor=file_executor,
+                    )
+                except Exception as error:
+                    raise DocumentError("snapshot_integrity_failed", 409) from error
+            for part in evidence.ranges:
+                block = await session.get(ParseBlock, part.block_id)
+                if (
+                    block is None
+                    or block.parse_snapshot_id != evidence.parse_snapshot_id
+                    or block.reading_order != part.block_reading_order
+                    or not 0 <= part.start < part.end <= len(block.text)
+                    or part.text != block.text[part.start : part.end]
+                    or part.block_type != block.block_type
+                    or part.locations != block.locations
+                    or part.quality_flags != block.quality_flags
+                ):
+                    raise DocumentError("evidence_range_invalid", 409)
+
+
+async def read_registered_evidence(database, store, request, *, max_json_bytes, file_executor):
+    """名称：有范围证据分页。用途：新取证检查完整 active scope，历史答案显式豁免移除。
+
+    Args:
+        request: library/run/evidence 及可选已保存 answer_id，均需同一绑定。
+        max_json_bytes, file_executor: 现有有界来源 I/O。
+    Returns:
+        固定证据区间的分页片段及续读偏移；历史读取不得用于扩展新 scope。
+    """
+    from academic_evidence_qa.infrastructure.database.models import AnswerArtifact
+
+    pack = await load_evidence_pack(database, request.library_id, request.retrieval_run_id)
+    historical = request.answer_id is not None
+    if historical:
+        async with database.sessions() as session:
+            answer = await session.get(AnswerArtifact, request.answer_id)
+            if (
+                answer is None
+                or answer.library_id != request.library_id
+                or answer.retrieval_run_id != pack.retrieval_run_id
+                or answer.state != "completed"
+            ):
+                raise DocumentError("historical_answer_not_found", 404)
+
+    async def check_members():
+        async with database.sessions() as session:
+            active = set(
+                (
+                    await session.scalars(
+                        select(LibraryPaper.paper_id).where(
+                            LibraryPaper.library_id == request.library_id,
+                            LibraryPaper.status == "active",
+                        )
+                    )
+                ).all()
+            )
+        if not {UUID(m["paper_id"]) for m in pack.scope.members}.issubset(active):
+            raise DocumentError("scope_membership_changed", 409)
+
+    if not historical:
+        await check_members()
+    evidence = next((e for e in pack.evidence if e.evidence_id == request.evidence_id), None)
+    if evidence is None:
+        raise DocumentError("evidence_not_found", 404)
+    await verify_evidence_sources(
+        database, store, pack, max_json_bytes=max_json_bytes, file_executor=file_executor
+    )
+    if request.offset >= len(evidence.ranges):
+        raise DocumentError("source_offset_invalid", 422)
+    part = evidence.ranges[request.offset]
+    if request.char_offset >= len(part.text):
+        raise DocumentError("source_offset_invalid", 422)
+    text = part.text[request.char_offset : request.char_offset + request.max_characters]
+    end = request.char_offset + len(text)
+    next_offset = request.offset if end < len(part.text) else request.offset + 1
+    next_char = end if end < len(part.text) else 0
+    if not historical:
+        await check_members()
+    return {
+        "evidence_id": evidence.evidence_id,
+        "retrieval_run_id": pack.retrieval_run_id,
+        "library_id": request.library_id,
+        "generation_id": pack.scope.generation_id,
+        "paper_id": evidence.paper_id,
+        "document_version_id": evidence.document_version_id,
+        "parse_snapshot_id": evidence.parse_snapshot_id,
+        "historical": historical,
+        "items": [
+            {
+                **part.model_dump(mode="json"),
+                "text": text,
+                "start": part.start + request.char_offset,
+                "end": part.start + end,
+            }
+        ],
+        "quality_flags": evidence.quality_flags,
+        "next_offset": next_offset if next_offset < len(evidence.ranges) else None,
+        "next_char_offset": next_char,
+    }

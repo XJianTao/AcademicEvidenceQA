@@ -57,6 +57,14 @@ class Settings:
     model_api_url: str = "http://127.0.0.1:8000"
     qdrant_url: str = "http://127.0.0.1:56333"
     inference_queue_capacity: int = 4
+    generation_base_url: str = ""
+    generation_model: str = ""
+    generation_api_key: str = ""
+    generation_context_tokens: int = 32000
+    generation_request_max_bytes: int = 96000
+    generation_evidence_max_bytes: int = 48000
+    generation_timeout_seconds: int = 120
+    generation_max_retries: int = 1
 
 
 def load_settings() -> Settings:
@@ -122,4 +130,12 @@ def load_settings() -> Settings:
         model_api_url=os.getenv("MODEL_API_URL", "http://127.0.0.1:8000"),
         qdrant_url=os.getenv("QDRANT_URL", "http://127.0.0.1:56333"),
         inference_queue_capacity=positive_int("INFERENCE_QUEUE_CAPACITY", 4),
+        generation_base_url=os.getenv("GENERATION_BASE_URL", ""),
+        generation_model=os.getenv("GENERATION_MODEL", ""),
+        generation_api_key=os.getenv("GENERATION_API_KEY", ""),
+        generation_context_tokens=positive_int("GENERATION_CONTEXT_TOKENS", 32000),
+        generation_request_max_bytes=positive_int("GENERATION_REQUEST_MAX_BYTES", 96000),
+        generation_evidence_max_bytes=positive_int("GENERATION_EVIDENCE_MAX_BYTES", 48000),
+        generation_timeout_seconds=positive_int("GENERATION_TIMEOUT_SECONDS", 120),
+        generation_max_retries=min(2, max(0, int(os.getenv("GENERATION_MAX_RETRIES", "1")))),
     )

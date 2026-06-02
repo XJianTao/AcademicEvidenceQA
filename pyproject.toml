@@ -4,6 +4,7 @@ version = "0.1.0"
 description = "AcademicEvidenceQA M0 reproducibility and feasibility checks"
 requires-python = ">=3.12,<3.13"
 dependencies = [
+  "openai==2.8.1",
   "fastapi==0.115.12",
   "pydantic==2.11.7",
   "uvicorn==0.34.3",
@@ -50,7 +51,7 @@ line-length = 100
 target-version = "py312"
 
 [tool.mypy]
-files = ["src/academic_evidence_qa/contracts/rag.py", "src/academic_evidence_qa/infrastructure/embedding_client.py"]
+files = ["src/academic_evidence_qa/contracts/rag.py", "src/academic_evidence_qa/infrastructure/embedding_client.py", "src/academic_evidence_qa/infrastructure/generation_client.py"]
 follow_imports = "skip"
 ignore_missing_imports = true
 check_untyped_defs = true

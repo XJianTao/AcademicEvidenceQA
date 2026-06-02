@@ -1,12 +1,12 @@
-"""模块名称：M2a-1 候选检索契约。
+"""模块名称：固定检索、证据与一次问答契约。
 
-用途：声明固定范围、候选来源与排序状态，不提前定义证据或答案。
+用途：声明固定范围、候选来源、持久证据及答案校验状态。
 核心设计：一次请求绑定不可变代及成员修订，分数与失败分别表达。
 工程要点：严格预算；来源校验失败不得作为模型降级返回。
 """
 
 from typing import Any, Literal
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -79,3 +79,94 @@ class RetrievalResult(BaseModel):
     statuses: list[str]
     configuration: dict[str, Any]
     timings: dict[str, float]
+
+
+class EvidenceRequest(RetrievalRequest):
+    """名称：正式取证请求。用途：在候选范围上声明封装预算，不依赖生成模型。"""
+
+    evidence_token_budget: int = Field(default=6000, ge=1, le=16000)
+
+
+class AnswerRequest(EvidenceRequest):
+    """名称：一次问答请求。用途：固定检索及输出上限，不允许扩展生成轮次。"""
+
+    max_output_tokens: int = Field(default=1200, ge=1, le=4096)
+
+
+class EvidenceRange(BaseModel):
+    """名称：原块区间。用途：保存数据库块身份和原文半开区间，非检索窗口偏移。"""
+
+    block_id: UUID
+    block_reading_order: int
+    start: int
+    end: int
+    text: str
+    block_type: str
+    locations: list[dict[str, Any]]
+    quality_flags: list[str]
+
+
+class Evidence(BaseModel):
+    """名称：持久证据。用途：跨重启回读固定来源，质量标记不得提升。"""
+
+    evidence_id: UUID = Field(default_factory=uuid4)
+    alias: str
+    paper_id: UUID
+    document_version_id: UUID
+    parse_snapshot_id: UUID
+    ranges: list[EvidenceRange]
+    quality_flags: list[str]
+
+
+class EvidencePack(BaseModel):
+    """名称：证据封装。用途：报告预算、固定范围与未覆盖情况，不声称全文覆盖。"""
+
+    retrieval_run_id: UUID = Field(default_factory=uuid4)
+    scope: FixedScope
+    evidence: list[Evidence]
+    status: Literal["ready", "insufficient_evidence", "budget_exhausted"]
+    budget_mode: Literal["estimated"] = "estimated"
+    token_count: int = 0
+    serialized_bytes: int = 0
+    truncated: bool = False
+    continuation: str | None = None
+    uncovered_paper_ids: list[UUID] = Field(default_factory=list)
+    degraded_reasons: list[str] = Field(default_factory=list)
+    timings: dict[str, float] = Field(default_factory=dict)
+
+
+class EvidenceReadRequest(BaseModel):
+    """名称：证据回读。用途：绑定库、取证记录及可选历史答案，ID 不作为权限。"""
+
+    model_config = ConfigDict(extra="forbid")
+    library_id: UUID
+    retrieval_run_id: UUID
+    evidence_id: UUID
+    answer_id: UUID | None = None
+    offset: int = Field(default=0, ge=0, le=100000)
+    char_offset: int = Field(default=0, ge=0, le=10000000)
+    max_characters: int = Field(default=12000, ge=1, le=32000)
+
+
+class Citation(BaseModel):
+    """名称：答案引用。用途：固定本次别名与已持久化证据的映射。"""
+
+    alias: str
+    evidence_id: UUID
+
+
+class Answer(BaseModel):
+    """名称：答案交付。用途：完整性与语义支持分开，无效草稿不作为 final 交付。"""
+
+    answer_id: UUID
+    retrieval_run_id: UUID
+    status: Literal["answered", "insufficient_evidence", "budget_exhausted", "citation_failed"]
+    text: str | None = None
+    citations: list[Citation] = Field(default_factory=list)
+    citation_check_status: Literal["passed", "failed", "not_run"] = "not_run"
+    support_check_status: Literal["not_run"] = "not_run"
+    diagnostics: list[str] = Field(default_factory=list)
+    usage: dict[str, Any] = Field(default_factory=dict)
+    timings: dict[str, float] = Field(default_factory=dict)
+    budget_mode: Literal["estimated"] = "estimated"
+    stream_status: Literal["not_enabled"] = "not_enabled"

@@ -20,6 +20,7 @@ from academic_evidence_qa.api.routes import router
 from academic_evidence_qa.api.routes import internal_router, retrieval_router
 from academic_evidence_qa.bootstrap import initialize_retrieval, close_retrieval
 from academic_evidence_qa.infrastructure.inference_executor import RuntimeErrorCode
+from academic_evidence_qa.infrastructure.inference_executor import BoundedExecutor
 from academic_evidence_qa.config import load_settings
 from academic_evidence_qa.contracts.documents import DocumentError
 from academic_evidence_qa.documents.parser import ParserError
@@ -52,10 +53,15 @@ def create_app(settings=None, *, database=None, store=None, with_models=None):
         try:
             if with_models:
                 await initialize_retrieval(app)
+            else:
+                # 历史来源回读不依赖模型，但仍复用同样的有界文件 I/O 边界。
+                app.state.source_io = BoundedExecutor(4)
             yield
         finally:
             if with_models and getattr(app.state, "runtime", None) is not None:
                 await close_retrieval(app)
+            elif not with_models:
+                await app.state.source_io.close()
             if owned:
                 await database.close()
 
@@ -63,6 +69,7 @@ def create_app(settings=None, *, database=None, store=None, with_models=None):
     app.state.settings, app.state.database, app.state.store = settings, database, store
     app.state.management = ManagementService(database, store, settings)
     app.state.retrieval = None
+    app.state.evidence = app.state.answering = app.state.generation = None
 
     @app.exception_handler(RuntimeErrorCode)
     async def runtime_error(request, error):

@@ -48,7 +48,10 @@ async def bounded_json(request, limit):
             raise DocumentError("request_body_too_large", 413)
         data.extend(part)
     try:
-        return json.loads(data)
+        value = json.loads(data)
+        if not isinstance(value, dict):
+            raise ValueError("object_required")
+        return value
     except (ValueError, UnicodeError) as error:
         raise DocumentError("request_invalid", 422) from error
 
@@ -300,12 +303,71 @@ async def outline(
         body,
         outline=True,
         max_json_bytes=state.settings.result_max_json_bytes,
+        file_executor=getattr(state, "source_io", None),
     )
 
 
-@router.post("/evidence/read", response_model=SourceResponse, response_model_exclude_unset=True)
-async def read_source(body: SourceRequest, request: Request):
+@router.post("/evidence/read")
+async def read_source(request: Request):
+    from academic_evidence_qa.contracts.rag import EvidenceReadRequest
+    from academic_evidence_qa.documents.source_reader import read_registered_evidence
+
     state = request.app.state
+    raw = await bounded_json(request, 16 * 1024)
+    try:
+        body = (EvidenceReadRequest if "evidence_id" in raw else SourceRequest).model_validate(raw)
+    except ValidationError as error:
+        raise DocumentError("request_invalid", 422) from error
+    if isinstance(body, EvidenceReadRequest):
+        return await read_registered_evidence(
+            state.database,
+            state.store,
+            body,
+            max_json_bytes=state.settings.result_max_json_bytes,
+            file_executor=getattr(state, "source_io", None),
+        )
     return await read_scoped_source(
-        state.database, state.store, body, max_json_bytes=state.settings.result_max_json_bytes
+        state.database,
+        state.store,
+        body,
+        max_json_bytes=state.settings.result_max_json_bytes,
+        file_executor=getattr(state, "source_io", None),
     )
+
+
+@retrieval_router.post("/retrieve")
+async def retrieve_evidence(request: Request):
+    from academic_evidence_qa.contracts.rag import EvidenceRequest
+
+    state = require_runtime(request)
+    try:
+        body = EvidenceRequest.model_validate(await bounded_json(request, 24 * 1024))
+    except ValidationError as error:
+        raise DocumentError("request_invalid", 422) from error
+    return await state.evidence.retrieve(body)
+
+
+@retrieval_router.post("/answer")
+async def answer_question(request: Request, idempotency_key: str | None = Header(default=None)):
+    from academic_evidence_qa.contracts.rag import AnswerRequest
+
+    state = require_runtime(request)
+    try:
+        body = AnswerRequest.model_validate(await bounded_json(request, 24 * 1024))
+    except ValidationError as error:
+        raise DocumentError("request_invalid", 422) from error
+    return await state.answering.answer(body, idempotency_key)
+
+
+@retrieval_router.get("/answers/{answer_id}")
+async def saved_answer(answer_id: UUID, request: Request, library_id: UUID):
+    # 历史回读无需模型 owner 或生成配置。
+    from academic_evidence_qa.infrastructure.database.models import AnswerArtifact
+
+    async with request.app.state.database.sessions() as session:
+        row = await session.get(AnswerArtifact, answer_id)
+        if row is None or row.library_id != library_id:
+            raise DocumentError("answer_not_found", 404)
+        if row.state != "completed":
+            return {"answer_id": answer_id, "state": row.state, "error_code": row.error_code}
+        return {**row.response, "historical": True}

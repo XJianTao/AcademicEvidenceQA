@@ -113,15 +113,15 @@ class RetrievalPipeline:
         if not {UUID(member["paper_id"]) for member in scope.members}.issubset(current):
             raise DocumentError("scope_membership_changed", 409)
 
-    async def retrieve(self, request):
+    async def retrieve(self, request, *, source_cache=None):
         """在有限请求预算内固定范围；超时不释放仍在运行的同步执行器槽位。"""
         try:
             async with asyncio.timeout(360):
-                return await self._retrieve(request)
+                return await self._retrieve(request, source_cache=source_cache)
         except TimeoutError as error:
             raise DocumentError("retrieval_timeout", 503) from error
 
-    async def _retrieve(self, request):
+    async def _retrieve(self, request, *, source_cache=None):
         started = time.monotonic()
         statuses, timings = [], {}
         async with self.database.sessions() as session:
@@ -324,7 +324,7 @@ class RetrievalPipeline:
                 if version is None or snapshot is None or version.paper_id != candidate.paper_id:
                     raise DocumentError("candidate_source_mismatch", 409)
                 try:
-                    await verify_snapshot(
+                    document = await verify_snapshot(
                         session,
                         version,
                         snapshot,
@@ -332,6 +332,8 @@ class RetrievalPipeline:
                         max_json_bytes=self.max_json_bytes,
                         file_executor=self.io,
                     )
+                    if source_cache is not None:
+                        source_cache[snapshot_id] = document
                 except Exception as error:
                     raise DocumentError("snapshot_integrity_failed", 409) from error
         await self._verify_active_members(scope)

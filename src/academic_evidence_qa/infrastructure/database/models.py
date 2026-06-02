@@ -415,3 +415,51 @@ class IndexChunk(Base):
     quality_flags: Mapped[list] = mapped_column(JSON)
     embedding_tokens: Mapped[int]
     reranker_tokens: Mapped[int]
+
+
+class RetrievalRun(Base):
+    """名称：固定取证记录。用途：持久 scope/封装及请求，回读不依赖旧向量索引。"""
+
+    __tablename__ = "retrieval_runs"
+    retrieval_run_id: Mapped[UUID] = mapped_column(primary_key=True)
+    library_id: Mapped[UUID] = mapped_column(ForeignKey("libraries.library_id"))
+    generation_id: Mapped[UUID] = mapped_column(ForeignKey("index_generations.generation_id"))
+    request: Mapped[dict] = mapped_column(JSON)
+    pack: Mapped[dict] = mapped_column(JSON)
+    pack_sha256: Mapped[str] = mapped_column(String(64))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class EvidenceRecord(Base):
+    """名称：证据注册记录。用途：将全局证据 ID 绑定唯一取证记录及不可变原文区间。"""
+
+    __tablename__ = "evidence_registry"
+    evidence_id: Mapped[UUID] = mapped_column(primary_key=True)
+    retrieval_run_id: Mapped[UUID] = mapped_column(ForeignKey("retrieval_runs.retrieval_run_id"))
+    payload: Mapped[dict] = mapped_column(JSON)
+    payload_sha256: Mapped[str] = mapped_column(String(64))
+
+
+class AnswerArtifact(Base):
+    """名称：答案与幂等屏障。用途：外部调用前先占 key，未知结果禁止重复付费生成。"""
+
+    __tablename__ = "answer_artifacts"
+    __table_args__ = (
+        UniqueConstraint("idempotency_key", name="uq_answer_idempotency"),
+        CheckConstraint(
+            "state IN ('pending', 'completed', 'failed', 'unknown')", name="ck_answer_state"
+        ),
+    )
+    answer_id: Mapped[UUID] = mapped_column(primary_key=True)
+    idempotency_key: Mapped[str] = mapped_column(String(128))
+    request_sha256: Mapped[str] = mapped_column(String(64))
+    library_id: Mapped[UUID] = mapped_column(ForeignKey("libraries.library_id"))
+    retrieval_run_id: Mapped[UUID | None] = mapped_column(
+        ForeignKey("retrieval_runs.retrieval_run_id")
+    )
+    state: Mapped[str] = mapped_column(String(16))
+    configuration: Mapped[dict] = mapped_column(JSON)
+    response: Mapped[dict | None] = mapped_column(JSON)
+    draft: Mapped[str | None] = mapped_column(Text)
+    error_code: Mapped[str | None] = mapped_column(String(128))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())

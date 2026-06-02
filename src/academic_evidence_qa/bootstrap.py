@@ -56,6 +56,35 @@ async def initialize_retrieval(app):
             state.source_io,
             max_json_bytes=state.settings.result_max_json_bytes,
         )
+        from openai import AsyncOpenAI
+        from academic_evidence_qa.infrastructure.generation_client import GenerationClient
+        from academic_evidence_qa.retrieval.evidence_builder import EvidenceBuilder
+        from academic_evidence_qa.answering.pipeline import AnswerPipeline
+
+        settings = state.settings
+        state.generation = None
+        if (
+            settings.generation_base_url
+            and settings.generation_model
+            and settings.generation_api_key
+        ):
+            state.generation = GenerationClient(
+                AsyncOpenAI(
+                    base_url=settings.generation_base_url,
+                    api_key=settings.generation_api_key,
+                    max_retries=0,
+                    timeout=settings.generation_timeout_seconds,
+                ),
+                model=settings.generation_model,
+                timeout_seconds=settings.generation_timeout_seconds,
+                max_retries=settings.generation_max_retries,
+                context_tokens=settings.generation_context_tokens,
+                max_bytes=settings.generation_request_max_bytes,
+            )
+        state.evidence = EvidenceBuilder(
+            state.retrieval, max_bytes=settings.generation_evidence_max_bytes
+        )
+        state.answering = AnswerPipeline(state.evidence, state.generation)
     except BaseException:
         await state.inference.close()
         await state.source_io.close()
@@ -64,6 +93,8 @@ async def initialize_retrieval(app):
 
 async def close_retrieval(app):
     """先等所有同步推理与来源读结束，再关闭连接及释放本生命周期权重。"""
+    if getattr(app.state, "generation", None):
+        await app.state.generation.close()
     await app.state.inference.close()
     await app.state.source_io.close()
     app.state.qdrant.close()
@@ -86,7 +117,9 @@ def parser_identity(settings):
             os.getenv("MINERU_BASE_URL", "https://mineru.net").encode()
         ).hexdigest(),
         "resources": {
-            key: value for key, value in vars(settings).items() if isinstance(value, int)
+            key: value
+            for key, value in vars(settings).items()
+            if isinstance(value, int) and not key.startswith("generation_")
         },
         "adapter_version": ADAPTER_VERSION,
     }
