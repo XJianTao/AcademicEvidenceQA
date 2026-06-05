@@ -88,9 +88,11 @@ class EvidenceRequest(RetrievalRequest):
 
 
 class AnswerRequest(EvidenceRequest):
-    """名称：一次问答请求。用途：固定检索及输出上限，不允许扩展生成轮次。"""
+    """名称：有界问答请求。用途：固定范围，最多两次补检索及一次同证据引用修复。"""
 
     max_output_tokens: int = Field(default=1200, ge=1, le=4096)
+    max_supplemental_retrievals: int = Field(default=2, ge=0, le=2)
+    allow_citation_repair: bool = True
 
 
 class EvidenceRange(BaseModel):
@@ -133,6 +135,8 @@ class EvidencePack(BaseModel):
     uncovered_paper_ids: list[UUID] = Field(default_factory=list)
     degraded_reasons: list[str] = Field(default_factory=list)
     timings: dict[str, float] = Field(default_factory=dict)
+    supplemental_retrievals: list[dict[str, Any]] = Field(default_factory=list)
+    uncovered_requirements: list[str] = Field(default_factory=list)
 
 
 class EvidenceReadRequest(BaseModel):
@@ -166,6 +170,7 @@ class Answer(BaseModel):
     citation_check_status: Literal["passed", "failed", "not_run"] = "not_run"
     support_check_status: Literal["not_run"] = "not_run"
     diagnostics: list[str] = Field(default_factory=list)
+    repair_diagnostics: list[dict[str, Any]] = Field(default_factory=list)
     usage: dict[str, Any] = Field(default_factory=dict)
     timings: dict[str, float] = Field(default_factory=dict)
     budget_mode: Literal["estimated"] = "estimated"

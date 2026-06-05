@@ -9,7 +9,7 @@ import asyncio
 from dataclasses import dataclass
 import json
 import time
-from typing import Any
+from typing import Any, cast
 
 from openai import (
     AsyncOpenAI,
@@ -43,9 +43,60 @@ class GenerationResult:
 class GenerationError(Exception):
     """名称：脱敏生成失败。用途：只公开固定类别及保守占用，不携带远端正文。"""
 
-    def __init__(self, code: str, reserved_tokens: int, attempts: int):
+    def __init__(
+        self, code: str, reserved_tokens: int, attempts: int, *, diagnostics=None, usage=None
+    ):
         self.code, self.reserved_tokens, self.attempts = code, reserved_tokens, attempts
+        self.diagnostics, self.usage = diagnostics or {}, usage or {}
         super().__init__(code)
+
+
+def response_metadata(response, *, attempts, per_attempt):
+    """名称：响应结构摘要。用途：在正文校验前保留白名单诊断及可得 usage。
+
+    Args:
+        response: SDK 响应；不得序列化完整对象、正文、拒绝文本或私有推理。
+        attempts, per_attempt: 实际次数及先前未知尝试的保守预留。
+    Returns:
+        脱敏结构摘要及归一化 usage；未知枚举只记 other，拒绝字符串透传。
+    """
+    # 兼容服务可能返回缺失结构；结构错误也不能丢掉已经返回的 usage。
+    choices = getattr(response, "choices", None)
+    choices = choices if isinstance(choices, list) else []
+    message = getattr(choices[0], "message", None) if len(choices) == 1 else None
+    content = getattr(message, "content", None)
+    finish = getattr(choices[0], "finish_reason", None) if len(choices) == 1 else None
+    diagnostics = {
+        "choice_count": len(choices),
+        "finish_reason": finish
+        if finish in ("stop", "length", "tool_calls", "content_filter", "function_call")
+        else "other",
+        "content_type": type(content).__name__
+        if type(content) in (str, list, dict, int, bool, float, type(None))
+        else "other",
+        "content_empty": content is None or (isinstance(content, str) and not content.strip()),
+        "has_refusal": bool(getattr(message, "refusal", None)),
+        "has_tool_calls": bool(getattr(message, "tool_calls", None)),
+    }
+    raw = getattr(response, "usage", None)
+
+    def token(field):
+        value = getattr(raw, field, None)
+        return value if type(value) is int and value >= 0 else None
+
+    actual = token("total_tokens")
+    details = getattr(raw, "completion_tokens_details", None)
+    reasoning = getattr(details, "reasoning_tokens", None)
+    usage = {
+        "status": "reported" if actual is not None and actual > 0 else "missing",
+        "input_tokens": token("prompt_tokens"),
+        "output_tokens": token("completion_tokens"),
+        "reasoning_tokens": reasoning if type(reasoning) is int and reasoning >= 0 else None,
+        "total_tokens": actual,
+        "attempts": attempts,
+        "accounted_tokens": (actual or per_attempt) + (attempts - 1) * per_attempt,
+    }
+    return diagnostics, usage
 
 
 class GenerationClient:
@@ -131,40 +182,50 @@ class GenerationClient:
                         raise GenerationError(
                             "generation_http_error", attempts * per_attempt, attempts
                         ) from None
+                    diagnostics, usage = response_metadata(
+                        response, attempts=attempts, per_attempt=per_attempt
+                    )
+                    choices = getattr(response, "choices", None)
+                    message = (
+                        getattr(choices[0], "message", None)
+                        if isinstance(choices, list) and len(choices) == 1
+                        else None
+                    )
+                    content = getattr(message, "content", None)
+                    rejected = []
+                    if diagnostics["choice_count"] != 1:
+                        rejected.append("choice_count")
+                    if diagnostics["finish_reason"] != "stop":
+                        rejected.append("finish_reason")
+                    if diagnostics["has_tool_calls"]:
+                        rejected.append("tool_calls")
+                    if diagnostics["has_refusal"]:
+                        rejected.append("refusal")
+                    if not isinstance(content, str):
+                        rejected.append("content_type")
+                    elif not content.strip():
+                        rejected.append("content_empty")
+                    elif len(content.encode()) > self.max_bytes:
+                        rejected.append("content_bytes_exceeded")
                     if (
-                        len(response.choices) != 1
-                        or response.choices[0].finish_reason != "stop"
-                        or response.choices[0].message.tool_calls
-                        or response.choices[0].message.refusal
-                        or not isinstance(response.choices[0].message.content, str)
-                        or not response.choices[0].message.content.strip()
-                        or len(response.choices[0].message.content.encode()) > self.max_bytes
+                        usage["output_tokens"] is not None
+                        and usage["output_tokens"] > max_output_tokens
                     ):
+                        rejected.append("output_tokens_exceeded")
+                    if rejected:
+                        diagnostics["rejection_categories"] = rejected
                         raise GenerationError(
-                            "generation_protocol_error", attempts * per_attempt, attempts
-                        )
-                    usage = response.usage
-                    if usage and usage.completion_tokens > max_output_tokens:
-                        raise GenerationError(
-                            "generation_output_limit_unsupported",
-                            max(attempts * per_attempt, usage.total_tokens),
+                            "generation_output_limit_unsupported"
+                            if "output_tokens_exceeded" in rejected
+                            else "generation_protocol_error",
+                            usage["accounted_tokens"],
                             attempts,
+                            diagnostics=diagnostics,
+                            usage=usage,
                         )
-                    actual = usage.total_tokens if usage and usage.total_tokens > 0 else None
                     return GenerationResult(
-                        response.choices[0].message.content,
-                        {
-                            "status": "reported" if actual else "missing",
-                            "input_tokens": usage.prompt_tokens if usage else None,
-                            "output_tokens": usage.completion_tokens if usage else None,
-                            "reasoning_tokens": usage.completion_tokens_details.reasoning_tokens
-                            if usage and usage.completion_tokens_details
-                            else None,
-                            "total_tokens": actual,
-                            "attempts": attempts,
-                            "accounted_tokens": (actual or per_attempt)
-                            + (attempts - 1) * per_attempt,
-                        },
+                        cast(str, content),  # 上方拒绝类别已保证纯非空文本；仅向类型检查器收窄。
+                        usage,
                         time.monotonic() - started,
                     )
         except (TimeoutError, APITimeoutError):
@@ -175,7 +236,10 @@ class GenerationClient:
             ) from None
         except (APIResponseValidationError, ValueError, AttributeError, TypeError):
             raise GenerationError(
-                "generation_protocol_error", attempts * per_attempt, attempts
+                "generation_protocol_error",
+                attempts * per_attempt,
+                attempts,
+                diagnostics={"rejection_categories": ["malformed_response"]},
             ) from None
         raise GenerationError("generation_protocol_error", attempts * per_attempt, attempts)
 

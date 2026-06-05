@@ -45,8 +45,12 @@ def reciprocal_rank_fusion(rankings, *, constant=60):
     return sorted(scores.items(), key=lambda item: (-item[1], item[0]))
 
 
-def scope_filter(scope):
-    """两路共享精确成员三元组过滤，不使用独立 paper/version 集合的笛卡尔积。"""
+def scope_filter(scope, recall_paper_ids=None):
+    """两路共享成员三元组；内部定向子集不改变对外完整固定 scope。"""
+    targets = None if recall_paper_ids is None else set(recall_paper_ids)
+    members = [m for m in scope.members if targets is None or UUID(m["paper_id"]) in targets]
+    if targets is not None and (not targets or len(members) != len(targets)):
+        raise DocumentError("supplement_target_out_of_scope", 409)
     return models.Filter(
         must=[
             models.FieldCondition(
@@ -65,7 +69,7 @@ def scope_filter(scope):
                             for key in ("paper_id", "document_version_id", "parse_snapshot_id")
                         ]
                     )
-                    for member in scope.members
+                    for member in members
                 ]
             ),
         ]
@@ -113,15 +117,25 @@ class RetrievalPipeline:
         if not {UUID(member["paper_id"]) for member in scope.members}.issubset(current):
             raise DocumentError("scope_membership_changed", 409)
 
-    async def retrieve(self, request, *, source_cache=None):
-        """在有限请求预算内固定范围；超时不释放仍在运行的同步执行器槽位。"""
+    async def retrieve(self, request, *, source_cache=None, recall_paper_ids=None):
+        """名称：固定范围检索。用途：有限期限内检索，可内部限定召回子集。
+
+        Args:
+            request: 原完整范围和固定代；定向补检索不得缩小此范围。
+            source_cache: 请求内已核验快照。
+            recall_paper_ids: 仅内部使用的非空论文子集，两路召回及来源拒绝均限制于此。
+        Returns:
+            完整 scope 下的候选；全部成员仍参与返回前 active 复核。
+        """
         try:
             async with asyncio.timeout(360):
-                return await self._retrieve(request, source_cache=source_cache)
+                return await self._retrieve(
+                    request, source_cache=source_cache, recall_paper_ids=recall_paper_ids
+                )
         except TimeoutError as error:
             raise DocumentError("retrieval_timeout", 503) from error
 
-    async def _retrieve(self, request, *, source_cache=None):
+    async def _retrieve(self, request, *, source_cache=None, recall_paper_ids=None):
         started = time.monotonic()
         statuses, timings = [], {}
         async with self.database.sessions() as session:
@@ -227,7 +241,7 @@ class RetrievalPipeline:
         if lengths[0] > 600 or (request.mode == "hybrid_rerank" and lengths[1] > 96):
             raise DocumentError("query_token_limit_exceeded", 422)
         vector = query_vector(request.query, statistics)
-        query_filter = scope_filter(scope)
+        query_filter = scope_filter(scope, recall_paper_ids)
 
         async def recall(route):
             try:
@@ -267,7 +281,9 @@ class RetrievalPipeline:
         )
         by_id = {c["chunk_id"]: c for c in chunks}
         identities = {
-            (m["paper_id"], m["document_version_id"], m["parse_snapshot_id"]) for m in members
+            (m["paper_id"], m["document_version_id"], m["parse_snapshot_id"])
+            for m in members
+            if recall_paper_ids is None or UUID(m["paper_id"]) in recall_paper_ids
         }
         for hit in dense + sparse:
             chunk = by_id.get(str(hit.id))

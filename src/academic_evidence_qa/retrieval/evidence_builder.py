@@ -5,7 +5,7 @@
 工程要点：同请求复用已核验文档；完整 JSON 计量，超限舍弃完整证据而非截断 JSON。
 """
 
-from uuid import UUID
+from uuid import UUID, uuid4
 from sqlalchemy import select
 
 from academic_evidence_qa.contracts.documents import DocumentError
@@ -17,6 +17,108 @@ from academic_evidence_qa.infrastructure.database.models import (
 )
 from academic_evidence_qa.infrastructure.generation_client import estimated_tokens, serialize
 from academic_evidence_qa.ingestion.index_builder import content_hash
+
+
+def evidence_gaps(query, pack):
+    """名称：确定性缺口。用途：只判断显式类型及局部跨论文覆盖，不推断语义支持。
+
+    Args:
+        query: 用户问题，不读取评测 gold。
+        pack: 当前固定来源封装。
+    Returns:
+        可解释的缺口列表；没有命中不意味着全文不存在答案。
+    """
+    lowered = query.lower()
+    gaps = []
+    types = {r.block_type for e in pack.evidence for r in e.ranges}
+    if any(word in lowered for word in ("table", "表格")) and "table" not in types:
+        gaps.append("table")
+    if any(word in lowered for word in ("formula", "equation", "公式")) and not types.intersection(
+        {"equation", "formula"}
+    ):
+        gaps.append("equation")
+    if any(word in lowered for word in ("compare", "比较", "跨论文")):
+        gaps.extend(f"paper:{paper}" for paper in pack.uncovered_paper_ids)
+    return gaps
+
+
+def merge_evidence_packs(original, extra, *, token_budget, max_bytes):
+    """名称：合并原文区间。用途：核验固定身份与重叠文本后去重，重新执行封装预算。
+
+    Args:
+        original, extra: 同一完整固定 scope 的已核验证据。
+        token_budget, max_bytes: 合并后的完整封装限制。
+    Returns:
+        新 registry 身份的封装，旧记录不改写；区间含原文，不拼造缺失文本。
+    """
+    if original.scope != extra.scope:
+        raise DocumentError("supplement_scope_mismatch", 409)
+    merged = original.model_copy(deep=True)
+    merged.retrieval_run_id = uuid4()
+    merged.evidence = []
+    for evidence in original.evidence + extra.evidence:
+        for source in evidence.ranges:
+            insertion_index = len(merged.evidence)
+            current = evidence.model_copy(deep=True)
+            current.ranges = [source.model_copy(deep=True)]
+            current.evidence_id = uuid4()
+            for existing in list(merged.evidence):
+                left = existing.ranges[0]
+                right = current.ranges[0]
+                if (
+                    (existing.paper_id, existing.document_version_id, existing.parse_snapshot_id)
+                    != (current.paper_id, current.document_version_id, current.parse_snapshot_id)
+                    or left.block_id != right.block_id
+                    or left.end < right.start
+                    or right.end < left.start
+                ):
+                    continue
+                if (left.start, left.end) > (right.start, right.end):
+                    left, right = right, left
+                overlap = min(left.end, right.end) - right.start
+                if (
+                    left.text[right.start - left.start : right.start - left.start + overlap]
+                    != right.text[:overlap]
+                ):
+                    raise DocumentError("supplement_source_mismatch", 409)
+                current.ranges = [
+                    left.model_copy(
+                        update={
+                            "end": max(left.end, right.end),
+                            "text": left.text + right.text[max(0, left.end - right.start) :],
+                            "quality_flags": sorted(set(left.quality_flags + right.quality_flags)),
+                        }
+                    )
+                ]
+                current.quality_flags = sorted(set(current.quality_flags + existing.quality_flags))
+                insertion_index = min(insertion_index, merged.evidence.index(existing))
+                merged.evidence.remove(existing)
+            # 重叠补充沿用首轮位置，不能因去重将优先证据推到预算裁剪尾部。
+            merged.evidence.insert(insertion_index, current)
+    merged.degraded_reasons = sorted(set(original.degraded_reasons + extra.degraded_reasons))
+    while True:
+        for index, evidence in enumerate(merged.evidence, 1):
+            evidence.alias = f"E{index}"
+        merged.uncovered_paper_ids = [
+            UUID(m["paper_id"])
+            for m in merged.scope.members
+            if UUID(m["paper_id"]) not in {e.paper_id for e in merged.evidence}
+        ]
+        merged.status = (
+            "ready"
+            if merged.evidence
+            else "budget_exhausted"
+            if merged.truncated or original.evidence or extra.evidence
+            else "insufficient_evidence"
+        )
+        measure_pack(merged)
+        if not merged.evidence or (
+            merged.token_count <= token_budget and merged.serialized_bytes <= max_bytes
+        ):
+            break
+        merged.evidence.pop()
+        merged.truncated = True
+    return merged
 
 
 def measure_pack(pack):
@@ -160,9 +262,11 @@ class EvidenceBuilder:
     def __init__(self, retrieval, *, max_bytes=48000):
         self.retrieval, self.max_bytes = retrieval, max_bytes
 
-    async def retrieve(self, request, *, source_cache=None):
+    async def retrieve(self, request, *, source_cache=None, recall_paper_ids=None):
         cache = {} if source_cache is None else source_cache
-        result = await self.retrieval.retrieve(request, source_cache=cache)
+        result = await self.retrieval.retrieve(
+            request, source_cache=cache, recall_paper_ids=recall_paper_ids
+        )
         if "recall_unavailable" in result.statuses:
             raise DocumentError("recall_unavailable", 503)
         blocks = {}
