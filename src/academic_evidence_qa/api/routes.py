@@ -11,8 +11,9 @@ from pathlib import Path
 from uuid import UUID
 
 from fastapi import APIRouter, Request, Header, Query
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import ValidationError
+from sqlalchemy import select
 
 from academic_evidence_qa.api.multipart import receive_management_upload
 from academic_evidence_qa.api.schemas import (
@@ -32,6 +33,7 @@ from academic_evidence_qa.api.schemas import (
 from academic_evidence_qa.contracts.documents import DocumentError
 from academic_evidence_qa.documents.source_reader import read_scoped_source
 from academic_evidence_qa.documents.upload import preflight_and_store_pdf, _remove_upload_directory
+from academic_evidence_qa.infrastructure.local_file_store import FileIntegrityError, StoredObject
 
 router = APIRouter(prefix="/v1")
 internal_router = APIRouter(prefix="/internal")
@@ -335,6 +337,220 @@ async def read_source(request: Request):
     )
 
 
+def _parse_byte_range(value: str | None, size: int) -> tuple[int, int] | None:
+    """解析单段 RFC 7233 字节范围；返回闭区间，非法或不可满足时返回 None。"""
+    if value is None:
+        return (0, size - 1) if size else None
+    if size <= 0 or len(value) > 128 or "," in value:
+        return None
+    match = re.fullmatch(r"bytes\s*=\s*([0-9]*)\s*-\s*([0-9]*)", value.strip())
+    if match is None:
+        return None
+    start_text, end_text = match.groups()
+    if not start_text and not end_text:
+        return None
+    if not start_text:
+        suffix = int(end_text)
+        if suffix <= 0:
+            return None
+        return max(0, size - suffix), size - 1
+    start = int(start_text)
+    if start >= size:
+        return None
+    end = min(int(end_text), size - 1) if end_text else size - 1
+    if end < start:
+        return None
+    return start, end
+
+
+async def _verify_pdf_source(
+    request: Request,
+    document_version_id: UUID,
+    *,
+    library_id: UUID,
+    generation_id: UUID,
+    paper_id: UUID,
+    parse_snapshot_id: UUID,
+    answer_id: UUID | None = None,
+    retrieval_run_id: UUID | None = None,
+):
+    """核验 PDF 完整来源；仅同库已完成答案的原证据允许读取软移除成员。"""
+    from academic_evidence_qa.documents.source_reader import load_evidence_pack
+    from academic_evidence_qa.ingestion.index_builder import content_hash
+    from academic_evidence_qa.infrastructure.database.models import (
+        AnswerArtifact,
+        DocumentVersion,
+        IndexGeneration,
+        LibraryPaper,
+        ParseSnapshotRecord,
+        StoredFile,
+    )
+
+    state = request.app.state
+    historical = answer_id is not None
+    if historical != (retrieval_run_id is not None):
+        raise DocumentError("historical_context_invalid", 422)
+    if historical:
+        async with state.database.sessions() as session:
+            answer = await session.get(AnswerArtifact, answer_id)
+            if (
+                answer is None
+                or answer.library_id != library_id
+                or answer.state != "completed"
+                or answer.retrieval_run_id != retrieval_run_id
+            ):
+                raise DocumentError("historical_answer_not_found", 404)
+        pack = await load_evidence_pack(state.database, library_id, retrieval_run_id)
+        identity = (str(paper_id), str(document_version_id), str(parse_snapshot_id))
+        if (
+            pack.scope.generation_id != generation_id
+            or identity
+            not in {
+                (item["paper_id"], item["document_version_id"], item["parse_snapshot_id"])
+                for item in pack.scope.members
+            }
+            or not any(
+                (item.paper_id, item.document_version_id, item.parse_snapshot_id)
+                == (paper_id, document_version_id, parse_snapshot_id)
+                for item in pack.evidence
+            )
+        ):
+            raise DocumentError("source_not_found", 404)
+    async with state.database.sessions() as session:
+        if not historical:
+            member = await session.scalar(
+                select(LibraryPaper).where(
+                    LibraryPaper.library_id == library_id,
+                    LibraryPaper.paper_id == paper_id,
+                    LibraryPaper.status == "active",
+                )
+            )
+            if member is None:
+                raise DocumentError("source_not_found", 404)
+        version = await session.get(DocumentVersion, document_version_id)
+        snapshot = await session.get(ParseSnapshotRecord, parse_snapshot_id)
+        generation = await session.get(IndexGeneration, generation_id)
+        if (
+            version is None
+            or snapshot is None
+            or generation is None
+            or version.paper_id != paper_id
+            or snapshot.document_version_id != document_version_id
+            or generation.library_id != library_id
+            or generation.state not in ("published", "retired")
+            or content_hash(generation.manifest) != generation.manifest_sha256
+            or not any(
+                (
+                    item.get("paper_id"),
+                    item.get("document_version_id"),
+                    item.get("parse_snapshot_id"),
+                )
+                == (str(paper_id), str(document_version_id), str(parse_snapshot_id))
+                for item in generation.manifest.get("members", [])
+            )
+        ):
+            raise DocumentError("source_not_found", 404)
+        stored = await session.get(StoredFile, version.file_id)
+        if stored is None or stored.file_sha256 != version.file_sha256:
+            raise DocumentError("source_file_identity_invalid", 409)
+        return StoredObject(
+            stored.file_id, stored.file_sha256, stored.object_key, stored.size_bytes
+        )
+
+
+@router.get("/documents/{document_version_id}/file")
+async def document_file(
+    document_version_id: UUID,
+    request: Request,
+    library_id: UUID,
+    generation_id: UUID,
+    paper_id: UUID,
+    parse_snapshot_id: UUID,
+    answer_id: UUID | None = None,
+    retrieval_run_id: UUID | None = None,
+):
+    """名称：受限 PDF 原件读取。用途：提供 PDF.js 单段 Range，不暴露本地路径。
+
+    Args:
+        document_version_id: 路径中的固定版本身份。
+        request: 含来源身份和可选 Range 请求头。
+        answer_id, retrieval_run_id: 可选且成对的历史答案上下文，错误绑定不降级放行。
+    Returns:
+        200/206 的有限头流式 PDF；来源或 Range 无效时返回稳定错误。
+    """
+    stored = await _verify_pdf_source(
+        request,
+        document_version_id,
+        library_id=library_id,
+        generation_id=generation_id,
+        paper_id=paper_id,
+        parse_snapshot_id=parse_snapshot_id,
+        answer_id=answer_id,
+        retrieval_run_id=retrieval_run_id,
+    )
+    state = request.app.state
+
+    def verify():
+        state.store.verify(stored)
+
+    executor = getattr(state, "source_io", None)
+    try:
+        if executor is None:
+            await asyncio.to_thread(verify)
+        else:
+            await executor.run(verify, wait_seconds=30.0, total_seconds=120.0)
+    except FileIntegrityError as error:
+        raise DocumentError("source_file_corrupt", 409) from error
+    # 原件哈希核验可能耗时；交付前重新核验普通成员状态或完整历史答案绑定。
+    current = await _verify_pdf_source(
+        request,
+        document_version_id,
+        library_id=library_id,
+        generation_id=generation_id,
+        paper_id=paper_id,
+        parse_snapshot_id=parse_snapshot_id,
+        answer_id=answer_id,
+        retrieval_run_id=retrieval_run_id,
+    )
+    if current != stored:
+        raise DocumentError("source_file_identity_invalid", 409)
+    byte_range = _parse_byte_range(request.headers.get("range"), stored.size_bytes)
+    if byte_range is None:
+        headers = {
+            "Accept-Ranges": "bytes",
+            "Content-Range": f"bytes */{stored.size_bytes}",
+            "Content-Length": "0",
+            "Cache-Control": "no-store",
+        }
+        return StreamingResponse(iter(()), status_code=416, headers=headers)
+
+    start, end = byte_range
+    length = end - start + 1
+
+    def chunks():
+        with state.store.open(stored.file_id) as source:
+            source.seek(start)
+            remaining = length
+            while remaining:
+                chunk = source.read(min(1024 * 1024, remaining))
+                if not chunk:
+                    break
+                remaining -= len(chunk)
+                yield chunk
+
+    headers = {
+        "Accept-Ranges": "bytes",
+        "Content-Length": str(length),
+        "Content-Type": "application/pdf",
+        "Cache-Control": "no-store",
+    }
+    status_code = 200
+    if request.headers.get("range") is not None:
+        status_code = 206
+        headers["Content-Range"] = f"bytes {start}-{end}/{stored.size_bytes}"
+    return StreamingResponse(chunks(), status_code=status_code, headers=headers)
+
+
 @retrieval_router.post("/retrieve")
 async def retrieve_evidence(request: Request):
     from academic_evidence_qa.contracts.rag import EvidenceRequest
@@ -350,19 +566,30 @@ async def retrieve_evidence(request: Request):
 @retrieval_router.post("/answer")
 async def answer_question(request: Request, idempotency_key: str | None = Header(default=None)):
     from academic_evidence_qa.contracts.rag import AnswerRequest
+    from academic_evidence_qa.documents.source_reader import load_evidence_pack
 
     state = require_runtime(request)
     try:
         body = AnswerRequest.model_validate(await bounded_json(request, 24 * 1024))
     except ValidationError as error:
         raise DocumentError("request_invalid", 422) from error
-    return await state.answering.answer(body, idempotency_key)
+    result = await state.answering.answer(body, idempotency_key)
+    # 答案响应必须携带本次答案实际使用的持久封装；不得重新检索来拼接引用。
+    pack = await load_evidence_pack(state.database, body.library_id, result.retrieval_run_id)
+    # 回读封装包含独立数据库等待；交付前再次拒绝该等待期间已提交的成员软移除。
+    await state.retrieval._verify_active_members(pack.scope)
+    payload = result.model_dump(mode="json")
+    payload["evidence_pack"] = pack.model_dump(mode="json")
+    payload["evidence"] = [item.model_dump(mode="json") for item in pack.evidence]
+    payload["scope"] = pack.scope.model_dump(mode="json")
+    return payload
 
 
 @retrieval_router.get("/answers/{answer_id}")
 async def saved_answer(answer_id: UUID, request: Request, library_id: UUID):
     # 历史回读无需模型 owner 或生成配置。
     from academic_evidence_qa.infrastructure.database.models import AnswerArtifact
+    from academic_evidence_qa.documents.source_reader import load_evidence_pack
 
     async with request.app.state.database.sessions() as session:
         row = await session.get(AnswerArtifact, answer_id)
@@ -370,4 +597,15 @@ async def saved_answer(answer_id: UUID, request: Request, library_id: UUID):
             raise DocumentError("answer_not_found", 404)
         if row.state != "completed":
             return {"answer_id": answer_id, "state": row.state, "error_code": row.error_code}
-        return {**row.response, "historical": True}
+        if row.retrieval_run_id is None:
+            raise DocumentError("answer_evidence_missing", 409)
+        pack = await load_evidence_pack(
+            request.app.state.database, library_id, row.retrieval_run_id
+        )
+        return {
+            **row.response,
+            "historical": True,
+            "evidence_pack": pack.model_dump(mode="json"),
+            "evidence": [item.model_dump(mode="json") for item in pack.evidence],
+            "scope": pack.scope.model_dump(mode="json"),
+        }
