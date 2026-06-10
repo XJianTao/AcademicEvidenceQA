@@ -5,11 +5,14 @@
 工程要点：断连/结构失败由接收器回收本次 staging；不相信 Content-Length。
 """
 
+from dataclasses import replace
+
 from python_multipart import MultipartParser
 from python_multipart.multipart import parse_options_header
 from python_multipart.exceptions import MultipartParseError
 
 from academic_evidence_qa.contracts.documents import DocumentError
+from academic_evidence_qa.documents.filenames import normalize_original_filename
 from academic_evidence_qa.documents.upload import receive_pdf_stream
 
 
@@ -42,6 +45,7 @@ async def receive_management_upload(request, store, max_upload_bytes):
         "size": 0,
     }
     ended, total = False, 0
+    original_filename = None
     allowed = {
         "file",
         "library_id",
@@ -76,6 +80,7 @@ async def receive_management_upload(request, store, max_upload_bytes):
         current["header_value"].clear()
 
     def headers_finished():
+        nonlocal original_filename
         disposition, params = parse_options_header(
             current["headers"].get(b"content-disposition", b"")
         )
@@ -92,6 +97,11 @@ async def receive_management_upload(request, store, max_upload_bytes):
             b"application/octet-stream",
         ):
             raise DocumentError("pdf_type_invalid", 422)
+        if name == "file":
+            try:
+                original_filename = normalize_original_filename(params[b"filename"].decode("utf-8"))
+            except UnicodeError as error:
+                raise DocumentError("original_filename_invalid", 422) from error
         seen.add(name)
         current["name"] = name
 
@@ -152,4 +162,4 @@ async def receive_management_upload(request, store, max_upload_bytes):
     received = await receive_pdf_stream(
         file_chunks(), file_store=store, max_upload_bytes=max_upload_bytes
     )
-    return received, fields
+    return replace(received, original_filename=original_filename), fields

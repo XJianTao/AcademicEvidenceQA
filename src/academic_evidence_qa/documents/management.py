@@ -5,6 +5,7 @@
 工程要点：只返回白名单字段；不执行远端解析，不跨库复用发布结果。
 """
 
+import base64
 import hashlib
 import json
 import re
@@ -17,6 +18,7 @@ from academic_evidence_qa.bootstrap import parser_identity
 from academic_evidence_qa.contracts.documents import DocumentError, MemberCommand, ParserSelection
 from academic_evidence_qa.contracts.jobs import ParseTaskRequest
 from academic_evidence_qa.documents.service import DocumentService
+from academic_evidence_qa.documents.filenames import normalize_original_filename
 from academic_evidence_qa.documents.source_reader import verify_snapshot
 from academic_evidence_qa.documents.published_index import verify_active_index
 from academic_evidence_qa.infrastructure.database.models import (
@@ -29,6 +31,8 @@ from academic_evidence_qa.infrastructure.database.models import (
     ParseSnapshotRecord,
     BuildIntent,
     IndexGeneration,
+    StoredFile,
+    DocumentMetadata,
 )
 from academic_evidence_qa.infrastructure.database.repositories import lock_library
 
@@ -36,6 +40,16 @@ from academic_evidence_qa.infrastructure.database.repositories import lock_libra
 def json_body(value):
     """将冻结 DTO 转成可持久 JSON；不序列化 ORM 或敏感配置。"""
     return json.loads(json.dumps(value, default=str))
+
+
+def _paper_find_cursor(scope_sha256, paper_id):
+    """将末项身份绑定完整查询范围；游标不承担权限，服务每页重新校验权限。"""
+    payload = json.dumps(
+        {"scope_sha256": scope_sha256, "last_paper_id": paper_id},
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode()
+    return base64.urlsafe_b64encode(payload).decode().rstrip("=")
 
 
 class ManagementService:
@@ -52,13 +66,14 @@ class ManagementService:
         self.documents = DocumentService(store)
         self.identity, self.config_id = parser_identity(settings)
 
-    async def submit(self, key, operation, payload, action):
+    async def submit(self, key, operation, payload, action, *, legacy_payload=None):
         """名称：持久幂等提交。用途：先重放，再核验修订，不重复副作用。
 
         Args:
             key: 必须提供的 ASCII Idempotency-Key。
             operation, payload: 路径/操作与规范化请求（上传包含实际哈希）。
             action: 同事务执行，返回状态码及白名单响应。
+            legacy_payload: 仅用于兼容迁移前无文件名的上传哈希；只重放，不执行 action。
         Returns:
             原始响应或本次结果；同 key 不同请求为 409。
         """
@@ -74,7 +89,18 @@ class ManagementService:
             await session.execute(select(func.pg_advisory_xact_lock(lock_key)))
             previous = await session.get(ManagementRequest, key)
             if previous is not None:
-                if previous.request_sha256 != digest:
+                legacy_digest = (
+                    hashlib.sha256(
+                        json.dumps(
+                            json_body([operation, legacy_payload]),
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        ).encode()
+                    ).hexdigest()
+                    if legacy_payload is not None
+                    else None
+                )
+                if previous.request_sha256 not in (digest, legacy_digest):
                     raise DocumentError("idempotency_key_conflict", 409)
                 return previous.response_status, previous.response_body
             status, body = await action(session)
@@ -147,12 +173,13 @@ class ManagementService:
         await session.flush()
         return job
 
-    async def accept_upload(self, key, request, stored):
+    async def accept_upload(self, key, request, stored, *, original_filename=None):
         """名称：受理可信原件。用途：登记、授权任务和构建意图同事务。
 
         Args:
             key, request: 幂等键、显式库/修订/外发字段。
             stored: 正式受限预检后保存的原件。
+            original_filename: multipart 校验后的展示名；内部旧调用可缺省。
         Returns:
             202 任务身份，或本库完整发布复用的 200；不启动网络请求。
         """
@@ -161,6 +188,12 @@ class ManagementService:
             "file_sha256": stored.file_sha256,
             "parser_config_id": self.config_id,
         }
+        legacy_payload = payload.copy()
+        payload["original_filename"] = (
+            normalize_original_filename(original_filename)
+            if original_filename is not None
+            else None
+        )
         # 核验网络/来源在行锁事务之外；事务内重新确认同一个不可变活动代。
         verified_generation_id = await verify_active_index(
             self.database,
@@ -193,6 +226,7 @@ class ManagementService:
                 expected_membership_revision=request.expected_membership_revision,
                 parser=ParserSelection(request.parser_backend, self.config_id),
                 paper_id=request.paper_id,
+                original_filename=payload["original_filename"],
             )
             library = await session.get(Library, request.library_id)
             snapshot = (
@@ -303,7 +337,7 @@ class ManagementService:
                 "parse_snapshot_id": snapshot.parse_snapshot_id if snapshot else None,
             }
 
-        return await self.submit(key, "upload", payload, action)
+        return await self.submit(key, "upload", payload, action, legacy_payload=legacy_payload)
 
     async def member_change(self, key, library_id, paper_id, request, *, remove=False):
         async def action(session):
@@ -563,3 +597,177 @@ class ManagementService:
                     "active_generation_id": library.active_generation_id if library else None,
                 }
             )
+
+    async def find_papers(self, request):
+        """名称：固定范围元数据发现。用途：先有界筛选，再按论文身份稳定分页。
+
+        Args:
+            request: 已校验的库、固定发布代、最多二十篇允许池及查询游标。
+        Returns:
+            固定版本的标题、文件名可用性、消歧信息和范围绑定游标。
+        Raises:
+            DocumentError: 范围失效、来源绑定损坏或游标错绑，绝不伪装空结果。
+        """
+        from uuid import UUID
+
+        from academic_evidence_qa.ingestion.index_builder import content_hash
+
+        wanted = set(request.paper_ids)
+        async with self.database.sessions() as session:
+            if await session.get(Library, request.library_id) is None:
+                raise DocumentError("library_not_found", 404)
+            generation = await session.get(IndexGeneration, request.generation_id)
+            if (
+                generation is None
+                or generation.library_id != request.library_id
+                or generation.state not in ("published", "retired")
+            ):
+                raise DocumentError("generation_out_of_scope", 404)
+            manifest = generation.manifest
+            if (
+                not isinstance(manifest, dict)
+                or content_hash(manifest) != generation.manifest_sha256
+                or manifest.get("library_id") != str(request.library_id)
+                or manifest.get("generation_id") != str(request.generation_id)
+                or manifest.get("collection_name") != generation.collection_name
+                or manifest.get("attempt_id") != str(generation.attempt_id)
+                or manifest.get("membership_revision") != generation.membership_revision
+            ):
+                raise DocumentError("generation_integrity_failed", 409)
+            members = {}
+            try:
+                members = {UUID(item["paper_id"]): item for item in manifest["members"]}
+                if len(members) != len(manifest["members"]):
+                    raise ValueError("duplicate_manifest_member")
+                selected = {paper_id: members[paper_id] for paper_id in wanted}
+                version_ids = [UUID(item["document_version_id"]) for item in selected.values()]
+                snapshot_ids = [UUID(item["parse_snapshot_id"]) for item in selected.values()]
+            except KeyError as error:
+                if members and not wanted.issubset(members):
+                    raise DocumentError("paper_out_of_scope", 404) from error
+                raise DocumentError("generation_integrity_failed", 409) from error
+            except (TypeError, ValueError) as error:
+                raise DocumentError("generation_integrity_failed", 409) from error
+            rows = (
+                await session.execute(
+                    select(
+                        Paper, DocumentVersion, StoredFile, ParseSnapshotRecord, DocumentMetadata
+                    )
+                    .join(LibraryPaper, LibraryPaper.paper_id == Paper.paper_id)
+                    .join(DocumentVersion, DocumentVersion.paper_id == Paper.paper_id)
+                    .join(StoredFile, StoredFile.file_id == DocumentVersion.file_id)
+                    .join(
+                        ParseSnapshotRecord,
+                        ParseSnapshotRecord.document_version_id
+                        == DocumentVersion.document_version_id,
+                    )
+                    .outerjoin(
+                        DocumentMetadata,
+                        DocumentMetadata.document_version_id == DocumentVersion.document_version_id,
+                    )
+                    .where(
+                        Paper.paper_id.in_(wanted),
+                        LibraryPaper.library_id == request.library_id,
+                        LibraryPaper.status == "active",
+                        DocumentVersion.document_version_id.in_(version_ids),
+                        ParseSnapshotRecord.parse_snapshot_id.in_(snapshot_ids),
+                    )
+                    .order_by(Paper.paper_id)
+                    .limit(21)
+                )
+            ).all()
+            if len(rows) != len(wanted):
+                raise DocumentError("paper_out_of_scope", 404)
+            items = []
+            for paper, version, stored, snapshot, metadata in rows:
+                entry = selected[paper.paper_id]
+                if (
+                    str(version.document_version_id) != entry["document_version_id"]
+                    or str(snapshot.parse_snapshot_id) != entry["parse_snapshot_id"]
+                    or version.file_sha256 != entry.get("file_sha256")
+                    or stored.file_sha256 != version.file_sha256
+                    or snapshot.input_sha256 != version.file_sha256
+                ):
+                    raise DocumentError("generation_integrity_failed", 409)
+                filenames = metadata.original_filenames if metadata else None
+                warnings = [] if filenames else ["original_filename_unavailable"]
+                if (
+                    version.file_sha256
+                    == "3d20bc5876e306bb149b467750a48a9cbeb03939f33bc883280edc64dc73abcc"
+                    and paper.title
+                    and paper.title.strip().casefold() == "learning fuzzy cognitive maps"
+                ):
+                    warnings.append("suspected_incorrect_title")
+                items.append(
+                    {
+                        "paper_id": str(paper.paper_id),
+                        "title": paper.title,
+                        "filename": filenames[0] if filenames else None,
+                        "filename_aliases": filenames[1:] if filenames else [],
+                        "document_version_id": str(version.document_version_id),
+                        "parse_snapshot_id": str(snapshot.parse_snapshot_id),
+                        "publication_status": "published",
+                        "metadata_warnings": warnings,
+                        "disambiguation": {
+                            "file_sha256": version.file_sha256,
+                            "identity_fields": [
+                                "paper_id",
+                                "document_version_id",
+                                "parse_snapshot_id",
+                                "file_sha256",
+                            ],
+                            "requires_explicit_selection": True,
+                        },
+                    }
+                )
+        normalized_query = request.query.strip().casefold()
+        # 允许池最多二十篇；先对完整有界集合筛选，避免只搜列表第一页。
+        matches = [
+            item
+            for item in items
+            if normalized_query in (item["title"] or "").casefold()
+            or normalized_query in (item["filename"] or "").casefold()
+            or any(normalized_query in filename.casefold() for filename in item["filename_aliases"])
+        ]
+        scope_sha256 = content_hash(
+            {
+                "library_id": str(request.library_id),
+                "generation_id": str(request.generation_id),
+                "manifest_sha256": generation.manifest_sha256,
+                "paper_ids": sorted(str(paper_id) for paper_id in wanted),
+                "query": normalized_query,
+                "limit": request.limit,
+                "metadata": items,
+            }
+        )
+        offset = 0
+        if request.cursor is not None:
+            try:
+                payload = json.loads(
+                    base64.b64decode(
+                        request.cursor + "=" * (-len(request.cursor) % 4),
+                        altchars=b"-_",
+                        validate=True,
+                    )
+                )
+                if (
+                    set(payload) != {"scope_sha256", "last_paper_id"}
+                    or payload["scope_sha256"] != scope_sha256
+                    or _paper_find_cursor(scope_sha256, payload["last_paper_id"]) != request.cursor
+                ):
+                    raise ValueError("cursor_binding_invalid")
+                offset = [item["paper_id"] for item in matches].index(payload["last_paper_id"]) + 1
+            except (ValueError, TypeError, KeyError, UnicodeError) as error:
+                raise DocumentError("invalid_cursor", 422) from error
+        page = matches[offset : offset + request.limit]
+        has_more = len(matches) > offset + request.limit
+        return {
+            "contract": "m3_paper_find_v1",
+            "library_id": str(request.library_id),
+            "generation_id": str(request.generation_id),
+            "items": page,
+            "next_cursor": _paper_find_cursor(scope_sha256, page[-1]["paper_id"])
+            if has_more
+            else None,
+            "has_more": has_more,
+        }

@@ -7,7 +7,7 @@
 
 from uuid import UUID
 from typing import Literal
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 class StrictRequest(BaseModel):
@@ -60,6 +60,25 @@ class SourceRequest(StrictRequest):
     char_offset: int = Field(default=0, ge=0, le=10000000)
     limit: int = Field(default=20, ge=1, le=100)
     max_characters: int = Field(default=12000, ge=1, le=32000)
+
+
+class PaperFindRequest(StrictRequest):
+    """名称：固定发布元数据查询。用途：仅在宿主允许池内筛选和稳定续页。"""
+
+    library_id: UUID
+    generation_id: UUID
+    paper_ids: list[UUID] = Field(min_length=1, max_length=20)
+    query: str = Field(default="", max_length=200, strict=True)
+    limit: int = Field(default=10, ge=1, le=20, strict=True)
+    cursor: str | None = Field(default=None, max_length=2048, strict=True)
+
+    @field_validator("paper_ids")
+    @classmethod
+    def reject_duplicate_papers(cls, value):
+        """允许池必须显式且无重复，不能把无效输入静默规范成成功。"""
+        if len(value) != len(set(value)):
+            raise ValueError("duplicate_paper_ids")
+        return value
 
 
 class JobResponse(BaseModel):
@@ -156,6 +175,31 @@ class PaperListResponse(StrictResponse):
     library_id: UUID | None
     membership_revision: int | None
     active_generation_id: UUID | None
+
+
+class PaperFindItemResponse(StrictResponse):
+    """名称：发布论文消歧项。用途：用固定来源身份补足不可靠展示元数据。"""
+
+    paper_id: UUID
+    title: str | None
+    filename: str | None
+    filename_aliases: list[str] = Field(default_factory=list)
+    document_version_id: UUID
+    parse_snapshot_id: UUID
+    publication_status: Literal["published"]
+    metadata_warnings: list[str]
+    disambiguation: dict
+
+
+class PaperFindResponse(StrictResponse):
+    """固定范围内查询结果；无匹配是成功空页，不代替范围错误。"""
+
+    contract: Literal["m3_paper_find_v1"]
+    library_id: UUID
+    generation_id: UUID
+    items: list[PaperFindItemResponse]
+    next_cursor: str | None
+    has_more: bool
 
 
 class SourceItemResponse(StrictResponse):

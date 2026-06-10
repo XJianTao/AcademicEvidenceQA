@@ -28,6 +28,8 @@ from academic_evidence_qa.api.schemas import (
     MemberResponse,
     JobMutationResponse,
     PaperListResponse,
+    PaperFindRequest,
+    PaperFindResponse,
     SourceResponse,
 )
 from academic_evidence_qa.contracts.documents import DocumentError
@@ -176,7 +178,10 @@ async def upload_document(request: Request, idempotency_key: str | None = Header
             memory_mib=resources.settings.pdf_preflight_memory_mib,
         )
         return response(
-            await resources.management.accept_upload(idempotency_key, body, stored), UploadResponse
+            await resources.management.accept_upload(
+                idempotency_key, body, stored, original_filename=received.original_filename
+            ),
+            UploadResponse,
         )
     finally:
         await asyncio.to_thread(_remove_upload_directory, Path(received.staging_path).parent)
@@ -272,6 +277,16 @@ async def papers(
     request: Request, offset: int = Query(0, ge=0, le=100000), limit: int = Query(20, ge=1, le=100)
 ):
     return await request.app.state.management.list_papers(offset=offset, limit=limit)
+
+
+@router.post("/papers/find", response_model=PaperFindResponse)
+async def find_papers(request: Request):
+    """发布元数据查询只接受小型、明确范围的请求，不触发模型或生成。"""
+    try:
+        body = PaperFindRequest.model_validate(await bounded_json(request, 16 * 1024))
+    except ValidationError as error:
+        raise DocumentError("request_invalid", 422) from error
+    return await request.app.state.management.find_papers(body)
 
 
 @router.get(

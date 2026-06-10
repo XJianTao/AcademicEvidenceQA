@@ -31,9 +31,11 @@ from academic_evidence_qa.contracts.documents import (
     RegisteredDocument,
 )
 from academic_evidence_qa.contracts.jobs import ParseTaskCheckpoint, ParseTaskRequest
+from academic_evidence_qa.documents.filenames import normalize_original_filename
 from academic_evidence_qa.infrastructure.database import repositories
 from academic_evidence_qa.infrastructure.database.models import (
     BuildIntent,
+    DocumentMetadata,
     DocumentVersion,
     Library,
     LibraryPaper,
@@ -93,6 +95,7 @@ class DocumentService:
         *,
         paper_id: UUID | None = None,
         title: str | None = None,
+        original_filename: str | None = None,
     ) -> RegisteredDocument:
         """登记原件/版本
 
@@ -103,6 +106,7 @@ class DocumentService:
             source: 二进制流，本阶段假定上层已确认内容；不替代 PDF 预检。
             paper_id: 明确身份；与已有哈希所属论文冲突则拒绝。
             title: 仅用于新论文的可选元数据，不用于自动合并。
+            original_filename: 可核验的展示名；缺省不推测，不参与原件路径或身份。
         Returns:
             固定文件/版本身份；没有成员变更或构建意图。
         Raises:
@@ -110,7 +114,7 @@ class DocumentService:
         """
         self._require_transaction(session)
         stored = await asyncio.to_thread(self.file_store.write, source)
-        return await self._register_object(session, stored, paper_id, title)
+        return await self._register_object(session, stored, paper_id, title, original_filename)
 
     async def register_verified_document(
         self,
@@ -119,6 +123,7 @@ class DocumentService:
         *,
         paper_id: UUID | None = None,
         title: str | None = None,
+        original_filename: str | None = None,
     ) -> RegisteredDocument:
         """登记已验证原件。
 
@@ -126,6 +131,7 @@ class DocumentService:
             session: 调用方已开启的短事务。
             stored: 仅由 LocalFileStore 从受限预检后的 staging 发布的对象。
             paper_id, title: 明确论文身份或新论文展示标题。
+            original_filename: 可核验的展示名；缺省兼容历史内部调用。
         Returns:
             已提交前的固定文档版本身份。
         Raises:
@@ -135,7 +141,7 @@ class DocumentService:
         """
         self._require_transaction(session)
         await asyncio.to_thread(self.file_store.verify, stored)
-        return await self._register_object(session, stored, paper_id, title)
+        return await self._register_object(session, stored, paper_id, title, original_filename)
 
     async def register_in_library(
         self,
@@ -147,6 +153,7 @@ class DocumentService:
         parser: ParserSelection,
         paper_id: UUID | None = None,
         title: str | None = None,
+        original_filename: str | None = None,
     ) -> tuple[RegisteredDocument, MemberResult]:
         """登记到库
 
@@ -158,12 +165,13 @@ class DocumentService:
             library_id, expected_membership_revision: 库身份及期望修订，先锁库再锁哈希。
             parser: 新成员配置；已有成员配置不被普通登记改变。
             paper_id, title: 可选明确论文身份和新论文元数据。
+            original_filename: 可核验的展示名；同内容异名仅追加名称元数据。
         Returns:
             登记与成员结果；已有 removed 成员保持 removed，已有选版保持不变。
         """
         library = await self._checked_library(session, library_id, expected_membership_revision)
         stored = await asyncio.to_thread(self.file_store.write, source)
-        document = await self._register_object(session, stored, paper_id, title)
+        document = await self._register_object(session, stored, paper_id, title, original_filename)
         member = await repositories.find_member(session, library_id, document.paper_id)
         changed = member is None
         if member is None:
@@ -184,6 +192,7 @@ class DocumentService:
         parser: ParserSelection,
         paper_id: UUID | None = None,
         title: str | None = None,
+        original_filename: str | None = None,
     ) -> tuple[RegisteredDocument, MemberResult]:
         """将预检后原件以短事务登记到库。
 
@@ -192,13 +201,14 @@ class DocumentService:
             stored: 已由 FileStore 发布且刚复核完整性的服务对象。
             library_id, expected_membership_revision, parser: M1-A 成员修订契约。
             paper_id, title: 可选的明确论文身份/展示标题。
+            original_filename: 可核验的展示名；不改变已有成员选版和解析配置。
         Returns:
             固定版本和成员修订结果。
         """
         # 文件完整性校验放在库锁之前，避免磁盘 I/O 延长成员修订锁的持有时间。
         await asyncio.to_thread(self.file_store.verify, stored)
         library = await self._checked_library(session, library_id, expected_membership_revision)
-        document = await self._register_object(session, stored, paper_id, title)
+        document = await self._register_object(session, stored, paper_id, title, original_filename)
         member = await repositories.find_member(session, library_id, document.paper_id)
         changed = member is None
         if member is None:
@@ -208,6 +218,46 @@ class DocumentService:
             session.add(member)
             await self._record_change(session, library)
         return document, self._member_result(library, member, changed)
+
+    async def record_original_filename(
+        self,
+        session: AsyncSession,
+        document_version_id: UUID,
+        original_filename: str,
+    ) -> bool:
+        """名称：登记已核验文件名。用途：同内容首名固定，异名按确认顺序追加。
+
+        Args:
+            session: 调用方显式事务；本方法之后不再反向获取 Library 锁。
+            document_version_id: 导入或补录依据所关联的固定版本。
+            original_filename: 上传声明或可核验既有记录中的名称。
+        Returns:
+            实际新增名称时为 True；同名重复为 False，不产生解析或索引任务。
+        Raises:
+            DocumentError: 名称无效或固定版本不存在。
+        并发：沿用全局原件哈希事务锁，避免跨库重复导入丢失别名。
+        """
+        self._require_transaction(session)
+        filename = normalize_original_filename(original_filename)
+        version = await session.get(DocumentVersion, document_version_id)
+        if version is None:
+            raise DocumentError("document_version_not_found", 404)
+        await repositories.lock_file_hash(session, version.file_sha256)
+        metadata = await session.get(DocumentMetadata, document_version_id, populate_existing=True)
+        filenames = list(metadata.original_filenames or []) if metadata is not None else []
+        if filename in filenames:
+            return False
+        if metadata is None:
+            session.add(
+                DocumentMetadata(
+                    document_version_id=document_version_id,
+                    original_filenames=[filename],
+                )
+            )
+        else:
+            metadata.original_filenames = [*filenames, filename]
+        await session.flush()
+        return True
 
     async def create_parse_task(
         self, session: AsyncSession, request: ParseTaskRequest
@@ -529,6 +579,7 @@ class DocumentService:
         stored: StoredObject,
         paper_id: UUID | None,
         title: str | None,
+        original_filename: str | None,
     ) -> RegisteredDocument:
         await repositories.lock_file_hash(session, stored.file_sha256)
         version = await repositories.find_version_by_hash(session, stored.file_sha256)
@@ -571,6 +622,10 @@ class DocumentService:
             )
             session.add(version)
             await session.flush()
+        if original_filename is not None:
+            await self.record_original_filename(
+                session, version.document_version_id, original_filename
+            )
         return RegisteredDocument(
             version.paper_id,
             version.document_version_id,

@@ -137,6 +137,7 @@ class ReceivedPdf:
         upload_id: 服务生成的暂存目录身份。
         staging_path: 仅服务内部使用的可信绝对路径。
         size_bytes, sha256: 接收层逐块计算的实际值。
+        original_filename: 已校验的展示名；旧内部流调用可缺省，绝不作为磁盘路径。
     Returns:
         仅能由上传模块创建并交给预检/原件存储的对象。
     """
@@ -145,6 +146,7 @@ class ReceivedPdf:
     staging_path: str
     size_bytes: int
     sha256: str
+    original_filename: str | None = None
 
 
 @dataclass(frozen=True)

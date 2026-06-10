@@ -147,6 +147,23 @@ class DocumentVersion(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
+class DocumentMetadata(Base):
+    """名称：版本展示元数据。用途：独立登记原文件名，不改写不可变来源。
+
+    Args:
+        document_version_id: 已登记的固定版本身份，也是唯一主键。
+        original_filenames: 按确认顺序保存首名和别名；历史未知可为空。
+    Returns:
+        只供展示和发现的名称集合；不参与原件路径、解析配置或索引身份。
+    """
+
+    __tablename__ = "document_metadata"
+    document_version_id: Mapped[UUID] = mapped_column(
+        ForeignKey("document_versions.document_version_id"), primary_key=True
+    )
+    original_filenames: Mapped[list[str] | None] = mapped_column(JSON, nullable=True)
+
+
 class LibraryPaper(Base):
     """论文库成员
 
