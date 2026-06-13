@@ -178,7 +178,7 @@ class LibraryPaper(Base):
     """
 
     __tablename__ = "library_papers"
-    __table_args__ = (
+    __table_args__=  (
         # 复合主键已经实现 UNIQUE(library_id, paper_id)，避免 PostgreSQL 折叠冗余约束。
         ForeignKeyConstraint(
             ["paper_id", "selected_document_version_id"],
@@ -455,6 +455,26 @@ class EvidenceRecord(Base):
     retrieval_run_id: Mapped[UUID] = mapped_column(ForeignKey("retrieval_runs.retrieval_run_id"))
     payload: Mapped[dict] = mapped_column(JSON)
     payload_sha256: Mapped[str] = mapped_column(String(64))
+
+
+class AgentDelivery(Base):
+    """名称：Agent 来源登记。用途：保存独立交付及多来源映射，不冒充 AnswerArtifact。
+
+    Args:
+        delivery_id: 宿主的稳定交付身份，同时作为登记幂等键。
+        request_sha256, payload_sha256: 分别绑定原输入及 RAG 核验后的完整白名单。
+    Returns:
+        registered 来源记录；是否 final 由宿主 append-only 会话持久化决定。
+    """
+
+    __tablename__ = "agent_deliveries"
+    delivery_id: Mapped[UUID] = mapped_column(primary_key=True)
+    library_id: Mapped[UUID] = mapped_column(ForeignKey("libraries.library_id"))
+    generation_id: Mapped[UUID] = mapped_column(ForeignKey("index_generations.generation_id"))
+    request_sha256: Mapped[str] = mapped_column(String(64))
+    payload: Mapped[dict] = mapped_column(JSON)
+    payload_sha256: Mapped[str] = mapped_column(String(64))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
 class AnswerArtifact(Base):

@@ -6,7 +6,7 @@
 """
 
 from uuid import UUID
-from typing import Literal
+from typing import Annotated, Literal
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
@@ -78,6 +78,71 @@ class PaperFindRequest(StrictRequest):
         """允许池必须显式且无重复，不能把无效输入静默规范成成功。"""
         if len(value) != len(set(value)):
             raise ValueError("duplicate_paper_ids")
+        return value
+
+
+class LibraryDiscoverRequest(StrictRequest):
+    """名称：显式全库发现。用途：在固定发布代内搜索所有仍活动的论文元数据。"""
+
+    generation_id: UUID
+    query: str = Field(default="", max_length=200, strict=True)
+    limit: int = Field(default=10, ge=1, le=20, strict=True)
+    cursor: str | None = Field(default=None, max_length=2048, strict=True)
+
+
+class AgentEvidenceSource(StrictRequest):
+    """登记真实 retrieval evidence，不接收客户端提供的正文或版本覆盖。"""
+
+    kind: Literal["evidence"]
+    alias: str = Field(pattern=r"^E[1-9][0-9]*$", max_length=16, strict=True)
+    retrieval_run_id: UUID
+    evidence_id: UUID
+
+
+class AgentBlockSource(StrictRequest):
+    """登记实际读取的原块半开区间，不伪造 retrieval evidence。"""
+
+    kind: Literal["block"]
+    alias: str = Field(pattern=r"^E[1-9][0-9]*$", max_length=16, strict=True)
+    paper_id: UUID
+    document_version_id: UUID
+    parse_snapshot_id: UUID
+    block_id: UUID
+    char_start: int = Field(ge=0, le=10000000, strict=True)
+    char_end: int = Field(gt=0, le=10000000, strict=True)
+
+
+class AgentSectionSource(StrictRequest):
+    """只登记目录标题及其位置；章节正文须逐块登记。"""
+
+    kind: Literal["section"]
+    alias: str = Field(pattern=r"^E[1-9][0-9]*$", max_length=16, strict=True)
+    paper_id: UUID
+    document_version_id: UUID
+    parse_snapshot_id: UUID
+    section_id: UUID
+
+
+AgentSource = Annotated[
+    AgentEvidenceSource | AgentBlockSource | AgentSectionSource, Field(discriminator="kind")
+]
+
+
+class AgentDeliveryRequest(StrictRequest):
+    """名称：可信宿主交付登记。用途：固定正文、全部来源和独立 delivery 身份。"""
+
+    delivery_id: UUID
+    library_id: UUID
+    generation_id: UUID
+    text: str = Field(min_length=1, max_length=32000, strict=True)
+    sources: list[AgentSource] = Field(min_length=1, max_length=64)
+
+    @field_validator("sources")
+    @classmethod
+    def reject_duplicate_aliases(cls, value):
+        """别名必须在整个交付内唯一，多次取证不得覆盖先前映射。"""
+        if len({item.alias for item in value}) != len(value):
+            raise ValueError("duplicate_citation_alias")
         return value
 
 
@@ -200,6 +265,28 @@ class PaperFindResponse(StrictResponse):
     items: list[PaperFindItemResponse]
     next_cursor: str | None
     has_more: bool
+
+
+class LibraryDiscoverResponse(PaperFindResponse):
+    """显式库级发现响应，不能被当作当前取证允许池。"""
+
+    contract: Literal["m3_library_discovery_v1"]
+
+
+class AgentDeliveryResponse(StrictResponse):
+    """经来源核验的登记结果；最终交付以宿主 append-only final 为准。"""
+
+    contract: Literal["m3_agent_delivery_v1"]
+    delivery_id: UUID
+    library_id: UUID
+    generation_id: UUID
+    text: str
+    citations: list[dict]
+    sources: list[dict]
+    citation_check_status: Literal["passed"]
+    support_check_status: Literal["not_run"]
+    registration_status: Literal["registered"]
+    payload_sha256: str
 
 
 class SourceItemResponse(StrictResponse):

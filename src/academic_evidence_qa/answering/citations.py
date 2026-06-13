@@ -9,17 +9,18 @@ import re
 from academic_evidence_qa.contracts.rag import Citation, EvidencePack
 
 
-def normalize_citations(text: str, pack: EvidencePack) -> tuple[str, list[Citation], list[str]]:
-    """名称：检查本次别名。用途：拒绝未知和缺失引用，保留原草稿诊断。
+def normalize_citation_aliases(
+    text: str, valid_aliases: set[str]
+) -> tuple[str, list[str], list[str]]:
+    """名称：检查引用别名。用途：共享格式规则，不虚构 EvidencePack 或证据身份。
 
     Args:
         text: 模型完整输出，论文内容仍是不可信数据。
-        pack: 当前固定、可回源 registry；来源可读性由调用方复核。
+        valid_aliases: 当前交付内经过来源核验的别名集合。
     Returns:
-        规范文本、有效 Citation 列表和错误类别；非空错误时不得交付正文。
+        规范文本、实际引用的合法别名和错误类别；非空错误时不得交付正文。
     限制：段落引用是格式规则，不能识别所有无依据事实；support_check_status 必须 not_run。
     """
-    registry = {e.alias: e.evidence_id for e in pack.evidence}
     aliases = []
     errors = []
 
@@ -33,7 +34,7 @@ def normalize_citations(text: str, pack: EvidencePack) -> tuple[str, list[Citati
             return value
         group = re.findall(r"E[1-9][0-9]*", value)
         aliases.extend(group)
-        if any(alias not in registry for alias in group):
+        if any(alias not in valid_aliases for alias in group):
             errors.append("unknown_citation_alias")
             return value
         return "".join(f"[{alias}]" for alias in group)
@@ -46,10 +47,21 @@ def normalize_citations(text: str, pack: EvidencePack) -> tuple[str, list[Citati
             break
     if not text.strip():
         errors.append("answer_empty")
-    citations = [
-        Citation(alias=a, evidence_id=registry[a]) for a in dict.fromkeys(aliases) if a in registry
-    ]
+    citations = [alias for alias in dict.fromkeys(aliases) if alias in valid_aliases]
     return normalized, citations, list(dict.fromkeys(errors))
+
+
+def normalize_citations(text: str, pack: EvidencePack) -> tuple[str, list[Citation], list[str]]:
+    """名称：兼容 EvidencePack 引用检查。用途：在共享别名规则后绑定真实 evidence ID。
+
+    Args:
+        text, pack: 原草稿和当前固定、可回源的 registry。
+    Returns:
+        规范正文、原有 Citation 契约和错误类别；不推断事实支持。
+    """
+    registry = {item.alias: item.evidence_id for item in pack.evidence}
+    normalized, aliases, errors = normalize_citation_aliases(text, set(registry))
+    return normalized, [Citation(alias=a, evidence_id=registry[a]) for a in aliases], errors
 
 
 def validate_citations(text: str, pack: EvidencePack) -> tuple[list[Citation], list[str]]:

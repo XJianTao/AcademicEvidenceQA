@@ -608,18 +608,33 @@ class ManagementService:
         Raises:
             DocumentError: 范围失效、来源绑定损坏或游标错绑，绝不伪装空结果。
         """
+        return await self._find_papers(request, request.library_id)
+
+    async def discover_papers(self, library_id, request):
+        """名称：固定代全库发现。用途：显式搜索全部已发布且仍活动的论文元数据。
+
+        Args:
+            library_id: 路径固定的库；不能由省略旧接口 paper_ids 隐式授权。
+            request: 固定发布代、查询及分页预算，不包含取证允许池。
+        Returns:
+            同来源字段的发现页；命中不表示用户已选篇或已获得正文授权。
+        """
+        return await self._find_papers(request, library_id, library_discovery=True)
+
+    async def _find_papers(self, request, library_id, *, library_discovery=False):
+        """共享元数据核验与分页；两种范围在查询和游标中保持明确区别。"""
         from uuid import UUID
 
         from academic_evidence_qa.ingestion.index_builder import content_hash
 
-        wanted = set(request.paper_ids)
+        wanted = None if library_discovery else set(request.paper_ids)
         async with self.database.sessions() as session:
-            if await session.get(Library, request.library_id) is None:
+            if await session.get(Library, library_id) is None:
                 raise DocumentError("library_not_found", 404)
             generation = await session.get(IndexGeneration, request.generation_id)
             if (
                 generation is None
-                or generation.library_id != request.library_id
+                or generation.library_id != library_id
                 or generation.state not in ("published", "retired")
             ):
                 raise DocumentError("generation_out_of_scope", 404)
@@ -627,7 +642,7 @@ class ManagementService:
             if (
                 not isinstance(manifest, dict)
                 or content_hash(manifest) != generation.manifest_sha256
-                or manifest.get("library_id") != str(request.library_id)
+                or manifest.get("library_id") != str(library_id)
                 or manifest.get("generation_id") != str(request.generation_id)
                 or manifest.get("collection_name") != generation.collection_name
                 or manifest.get("attempt_id") != str(generation.attempt_id)
@@ -639,6 +654,18 @@ class ManagementService:
                 members = {UUID(item["paper_id"]): item for item in manifest["members"]}
                 if len(members) != len(manifest["members"]):
                     raise ValueError("duplicate_manifest_member")
+                if library_discovery:
+                    wanted = set(
+                        (
+                            await session.scalars(
+                                select(LibraryPaper.paper_id).where(
+                                    LibraryPaper.library_id == library_id,
+                                    LibraryPaper.status == "active",
+                                    LibraryPaper.paper_id.in_(members),
+                                )
+                            )
+                        ).all()
+                    )
                 selected = {paper_id: members[paper_id] for paper_id in wanted}
                 version_ids = [UUID(item["document_version_id"]) for item in selected.values()]
                 snapshot_ids = [UUID(item["parse_snapshot_id"]) for item in selected.values()]
@@ -648,34 +675,29 @@ class ManagementService:
                 raise DocumentError("generation_integrity_failed", 409) from error
             except (TypeError, ValueError) as error:
                 raise DocumentError("generation_integrity_failed", 409) from error
-            rows = (
-                await session.execute(
-                    select(
-                        Paper, DocumentVersion, StoredFile, ParseSnapshotRecord, DocumentMetadata
-                    )
-                    .join(LibraryPaper, LibraryPaper.paper_id == Paper.paper_id)
-                    .join(DocumentVersion, DocumentVersion.paper_id == Paper.paper_id)
-                    .join(StoredFile, StoredFile.file_id == DocumentVersion.file_id)
-                    .join(
-                        ParseSnapshotRecord,
-                        ParseSnapshotRecord.document_version_id
-                        == DocumentVersion.document_version_id,
-                    )
-                    .outerjoin(
-                        DocumentMetadata,
-                        DocumentMetadata.document_version_id == DocumentVersion.document_version_id,
-                    )
-                    .where(
-                        Paper.paper_id.in_(wanted),
-                        LibraryPaper.library_id == request.library_id,
-                        LibraryPaper.status == "active",
-                        DocumentVersion.document_version_id.in_(version_ids),
-                        ParseSnapshotRecord.parse_snapshot_id.in_(snapshot_ids),
-                    )
-                    .order_by(Paper.paper_id)
-                    .limit(21)
+            query = (
+                select(Paper, DocumentVersion, StoredFile, ParseSnapshotRecord, DocumentMetadata)
+                .join(LibraryPaper, LibraryPaper.paper_id == Paper.paper_id)
+                .join(DocumentVersion, DocumentVersion.paper_id == Paper.paper_id)
+                .join(StoredFile, StoredFile.file_id == DocumentVersion.file_id)
+                .join(
+                    ParseSnapshotRecord,
+                    ParseSnapshotRecord.document_version_id == DocumentVersion.document_version_id,
                 )
-            ).all()
+                .outerjoin(
+                    DocumentMetadata,
+                    DocumentMetadata.document_version_id == DocumentVersion.document_version_id,
+                )
+                .where(
+                    Paper.paper_id.in_(wanted),
+                    LibraryPaper.library_id == library_id,
+                    LibraryPaper.status == "active",
+                    DocumentVersion.document_version_id.in_(version_ids),
+                    ParseSnapshotRecord.parse_snapshot_id.in_(snapshot_ids),
+                )
+                .order_by(Paper.paper_id)
+            )
+            rows = (await session.execute(query if library_discovery else query.limit(21))).all()
             if len(rows) != len(wanted):
                 raise DocumentError("paper_out_of_scope", 404)
             items = []
@@ -721,7 +743,7 @@ class ManagementService:
                     }
                 )
         normalized_query = request.query.strip().casefold()
-        # 允许池最多二十篇；先对完整有界集合筛选，避免只搜列表第一页。
+        # 显式库级发现覆盖全部活动的发布成员；旧接口仍只读最多二十篇允许池。
         matches = [
             item
             for item in items
@@ -731,7 +753,8 @@ class ManagementService:
         ]
         scope_sha256 = content_hash(
             {
-                "library_id": str(request.library_id),
+                "scope_kind": "library_discovery" if library_discovery else "bounded_pool",
+                "library_id": str(library_id),
                 "generation_id": str(request.generation_id),
                 "manifest_sha256": generation.manifest_sha256,
                 "paper_ids": sorted(str(paper_id) for paper_id in wanted),
@@ -762,8 +785,8 @@ class ManagementService:
         page = matches[offset : offset + request.limit]
         has_more = len(matches) > offset + request.limit
         return {
-            "contract": "m3_paper_find_v1",
-            "library_id": str(request.library_id),
+            "contract": "m3_library_discovery_v1" if library_discovery else "m3_paper_find_v1",
+            "library_id": str(library_id),
             "generation_id": str(request.generation_id),
             "items": page,
             "next_cursor": _paper_find_cursor(scope_sha256, page[-1]["paper_id"])

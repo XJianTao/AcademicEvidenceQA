@@ -65,6 +65,7 @@ class Settings:
     generation_evidence_max_bytes: int = 48000
     generation_timeout_seconds: int = 120
     generation_max_retries: int = 1
+    academic_host_token: str = ""
 
 
 def load_settings() -> Settings:
@@ -138,4 +139,5 @@ def load_settings() -> Settings:
         generation_evidence_max_bytes=positive_int("GENERATION_EVIDENCE_MAX_BYTES", 48000),
         generation_timeout_seconds=positive_int("GENERATION_TIMEOUT_SECONDS", 120),
         generation_max_retries=min(2, max(0, int(os.getenv("GENERATION_MAX_RETRIES", "1")))),
+        academic_host_token=os.getenv("ACADEMIC_HOST_TOKEN", ""),
     )

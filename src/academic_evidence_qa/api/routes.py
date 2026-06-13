@@ -6,6 +6,7 @@
 """
 
 import asyncio
+import hmac
 import re
 from pathlib import Path
 from uuid import UUID
@@ -30,6 +31,10 @@ from academic_evidence_qa.api.schemas import (
     PaperListResponse,
     PaperFindRequest,
     PaperFindResponse,
+    LibraryDiscoverRequest,
+    LibraryDiscoverResponse,
+    AgentDeliveryRequest,
+    AgentDeliveryResponse,
     SourceResponse,
 )
 from academic_evidence_qa.contracts.documents import DocumentError
@@ -40,6 +45,29 @@ from academic_evidence_qa.infrastructure.local_file_store import FileIntegrityEr
 router = APIRouter(prefix="/v1")
 internal_router = APIRouter(prefix="/internal")
 retrieval_router = APIRouter(prefix="/v1")
+
+
+def require_academic_host(request):
+    """仅可信宿主可登记或读取 Agent 历史；凭据不进入正文、响应或日志。"""
+    expected = request.app.state.settings.academic_host_token
+    if not expected:
+        raise DocumentError("academic_host_unconfigured", 503)
+    supplied = request.headers.get("x-academic-host-token", "")
+    if not supplied or not hmac.compare_digest(supplied.encode("utf-8"), expected.encode("utf-8")):
+        raise DocumentError("academic_host_forbidden", 403)
+
+
+def agent_delivery_service(request):
+    """按请求复用既有有界文件执行器，不加载模型或建立第二套运行时。"""
+    from academic_evidence_qa.answering.agent_deliveries import AgentDeliveryService
+
+    state = request.app.state
+    return AgentDeliveryService(
+        state.database,
+        state.store,
+        max_json_bytes=state.settings.result_max_json_bytes,
+        file_executor=getattr(state, "source_io", None),
+    )
 
 
 async def bounded_json(request, limit):
@@ -289,6 +317,60 @@ async def find_papers(request: Request):
     return await request.app.state.management.find_papers(body)
 
 
+@router.post("/libraries/{library_id}/papers/discover", response_model=LibraryDiscoverResponse)
+async def discover_papers(library_id: UUID, request: Request):
+    """显式固定代全库发现，旧接口省略 paper_ids 仍然非法。"""
+    try:
+        body = LibraryDiscoverRequest.model_validate(await bounded_json(request, 16 * 1024))
+    except ValidationError as error:
+        raise DocumentError("request_invalid", 422) from error
+    return await request.app.state.management.discover_papers(library_id, body)
+
+
+@router.post("/agent-deliveries", response_model=AgentDeliveryResponse)
+async def register_agent_delivery(request: Request):
+    """先认证再读取正文；只登记来源，不宣布宿主 final 已交付。"""
+    from academic_evidence_qa.answering.agent_deliveries import DELIVERY_MAX_BYTES
+
+    require_academic_host(request)
+    try:
+        body = AgentDeliveryRequest.model_validate(await bounded_json(request, DELIVERY_MAX_BYTES))
+    except ValidationError as error:
+        raise DocumentError("request_invalid", 422) from error
+    return await agent_delivery_service(request).register(body)
+
+
+@router.get("/agent-deliveries/{delivery_id}", response_model=AgentDeliveryResponse)
+async def get_agent_delivery(delivery_id: UUID, request: Request, library_id: UUID):
+    """宿主恢复原登记；浏览器不能把未写 final 的登记直接当作可信答案。"""
+    from academic_evidence_qa.answering.agent_deliveries import load_agent_delivery
+
+    require_academic_host(request)
+    return await load_agent_delivery(request.app.state.database, library_id, delivery_id)
+
+
+@router.get("/agent-deliveries/{delivery_id}/sources/{alias}")
+async def read_agent_source(
+    delivery_id: UUID,
+    alias: str,
+    request: Request,
+    library_id: UUID,
+    offset: int = Query(default=0, ge=0, le=100000),
+    char_offset: int = Query(default=0, ge=0, le=10000000),
+    max_characters: int = Query(default=12000, ge=1, le=32000),
+):
+    """由可信宿主代理的历史来源，范围严格限制在原登记且被引用的片段。"""
+    require_academic_host(request)
+    return await agent_delivery_service(request).read_source(
+        library_id,
+        delivery_id,
+        alias,
+        offset=offset,
+        char_offset=char_offset,
+        max_characters=max_characters,
+    )
+
+
 @router.get(
     "/papers/{paper_id}/outline", response_model=SourceResponse, response_model_exclude_unset=True
 )
@@ -388,8 +470,10 @@ async def _verify_pdf_source(
     parse_snapshot_id: UUID,
     answer_id: UUID | None = None,
     retrieval_run_id: UUID | None = None,
+    delivery_id: UUID | None = None,
+    citation_alias: str | None = None,
 ):
-    """核验 PDF 完整来源；仅同库已完成答案的原证据允许读取软移除成员。"""
+    """核验 PDF 完整来源；answer 或可信宿主 delivery 历史与普通成员上下文互斥。"""
     from academic_evidence_qa.documents.source_reader import load_evidence_pack
     from academic_evidence_qa.ingestion.index_builder import content_hash
     from academic_evidence_qa.infrastructure.database.models import (
@@ -402,10 +486,30 @@ async def _verify_pdf_source(
     )
 
     state = request.app.state
-    historical = answer_id is not None
-    if historical != (retrieval_run_id is not None):
+    answer_context = answer_id is not None or retrieval_run_id is not None
+    delivery_context = delivery_id is not None or citation_alias is not None
+    if (
+        (answer_context and delivery_context)
+        or (answer_id is None) != (retrieval_run_id is None)
+        or (delivery_id is None) != (citation_alias is None)
+    ):
         raise DocumentError("historical_context_invalid", 422)
-    if historical:
+    historical = answer_context or delivery_context
+    if delivery_context:
+        require_academic_host(request)
+        delivery, source = await agent_delivery_service(request).verified_source(
+            library_id, delivery_id, citation_alias
+        )
+        if delivery["generation_id"] != str(generation_id) or any(
+            source[key] != str(value)
+            for key, value in (
+                ("paper_id", paper_id),
+                ("document_version_id", document_version_id),
+                ("parse_snapshot_id", parse_snapshot_id),
+            )
+        ):
+            raise DocumentError("source_not_found", 404)
+    elif answer_context:
         async with state.database.sessions() as session:
             answer = await session.get(AnswerArtifact, answer_id)
             if (
@@ -483,6 +587,8 @@ async def document_file(
     parse_snapshot_id: UUID,
     answer_id: UUID | None = None,
     retrieval_run_id: UUID | None = None,
+    delivery_id: UUID | None = None,
+    citation_alias: str | None = None,
 ):
     """名称：受限 PDF 原件读取。用途：提供 PDF.js 单段 Range，不暴露本地路径。
 
@@ -490,6 +596,7 @@ async def document_file(
         document_version_id: 路径中的固定版本身份。
         request: 含来源身份和可选 Range 请求头。
         answer_id, retrieval_run_id: 可选且成对的历史答案上下文，错误绑定不降级放行。
+        delivery_id, citation_alias: 互斥的可信宿主历史交付上下文，不伪造 answer_id。
     Returns:
         200/206 的有限头流式 PDF；来源或 Range 无效时返回稳定错误。
     """
@@ -502,6 +609,8 @@ async def document_file(
         parse_snapshot_id=parse_snapshot_id,
         answer_id=answer_id,
         retrieval_run_id=retrieval_run_id,
+        delivery_id=delivery_id,
+        citation_alias=citation_alias,
     )
     state = request.app.state
 
@@ -526,6 +635,8 @@ async def document_file(
         parse_snapshot_id=parse_snapshot_id,
         answer_id=answer_id,
         retrieval_run_id=retrieval_run_id,
+        delivery_id=delivery_id,
+        citation_alias=citation_alias,
     )
     if current != stored:
         raise DocumentError("source_file_identity_invalid", 409)
