@@ -2,9 +2,10 @@
 
 用途：复用候选检索，按固定块区间扩展、重叠去重并保存证据 registry。
 核心设计：只扩展同块上下文及解析器明确的相关块；不猜公式/图表的语义关系。
-工程要点：同请求复用已核验文档；完整 JSON 计量，超限舍弃完整证据而非截断 JSON。
+工程要点：完整 JSON 计量；合并超限可按候选来源区间回退，不截断 JSON。
 """
 
+from typing import TypedDict
 from uuid import UUID, uuid4
 from sqlalchemy import select
 
@@ -17,6 +18,15 @@ from academic_evidence_qa.infrastructure.database.models import (
 )
 from academic_evidence_qa.infrastructure.generation_client import estimated_tokens, serialize
 from academic_evidence_qa.ingestion.index_builder import content_hash
+from academic_evidence_qa.retrieval.budget_diagnostics import EvidenceBudgetDiagnostics
+
+
+class _RangeMeasurement(TypedDict):
+    """仅在启用离线诊断时暂存区间；收集器只保留其长度计量。"""
+
+    start: int
+    end: int
+    text: str
 
 
 def evidence_gaps(query, pack):
@@ -131,15 +141,24 @@ def measure_pack(pack):
         pack.serialized_bytes, pack.token_count = size, tokens
 
 
-def select_evidence(result, blocks_by_snapshot, *, token_budget, max_bytes):
+def select_evidence(
+    result,
+    blocks_by_snapshot,
+    *,
+    token_budget,
+    max_bytes,
+    diagnostics: EvidenceBudgetDiagnostics | None = None,
+):
     """名称：选择原文证据。用途：按候选次序扩展240字符，合并重叠原块区间。
 
     Args:
         result: 已核验固定来源的候选响应，windows 仅用于重排而非原文定位。
         blocks_by_snapshot: 来自同次快照核验后的数据库块映射。
         token_budget, max_bytes: 完整封装限制，未知 tokenizer 保守估算。
+        diagnostics: 可选离线元数据收集器；不写入封装，不参与预算判定。
     Returns:
-        原文 EvidencePack；超长表保留原块分页读取能力，不伪造精确行框。
+        原文 EvidencePack；合并超限按原候选区间有界试放，关联整块仍整体选择。
+        超长表保留原块分页读取能力，不伪造精确行框。
     """
     pack = EvidencePack(
         scope=result.scope,
@@ -148,10 +167,36 @@ def select_evidence(result, blocks_by_snapshot, *, token_budget, max_bytes):
         degraded_reasons=list(result.statuses),
         timings=result.timings.copy(),
     )
-    intervals = {}
-    priority = []
-    candidate_flags = {}
-    for candidate in result.candidates:
+    intervals: dict[tuple[UUID, UUID, UUID, int], list[tuple[int, int]]] = {}
+    source_intervals: dict[tuple[UUID, UUID, UUID, int], list[tuple[int, int]]] = {}
+    whole_block_keys: set[tuple[UUID, UUID, UUID, int]] = set()
+    priority: list[tuple[UUID, UUID, UUID, int]] = []
+    candidate_flags: dict[tuple[UUID, UUID, UUID, int], set[str]] = {}
+    source_measurements: list[_RangeMeasurement] = []
+    expanded_measurements: list[_RangeMeasurement] = []
+    related_range_count = 0
+    if diagnostics is not None:
+        diagnostics.record(
+            "candidate_limit",
+            [c.model_dump(mode="json") for c in result.candidates],
+            item_count=len(result.candidates),
+            token_budget=token_budget,
+            max_bytes=max_bytes,
+        )
+        # 基础包仅在副本上收敛，避免诊断改变第一次试放时计数字段的初始值。
+        empty = pack.model_copy(deep=True)
+        measure_pack(empty)
+        diagnostics.record("empty_pack", empty.model_dump(mode="json"), item_count=0)
+    for ordinal, candidate in enumerate(result.candidates, 1):
+        if diagnostics is not None:
+            diagnostics.record(
+                "candidate",
+                candidate.model_dump(mode="json"),
+                ordinal=ordinal,
+                range_count=len(candidate.source_ranges),
+                text_characters=len(candidate.retrieval_text),
+                text_utf8_bytes=len(candidate.retrieval_text.encode("utf-8")),
+            )
         blocks = blocks_by_snapshot[candidate.parse_snapshot_id]
         for source in candidate.source_ranges:
             order = source["block_reading_order"]
@@ -163,6 +208,10 @@ def select_evidence(result, blocks_by_snapshot, *, token_budget, max_bytes):
                 type(start) is int and type(end) is int and 0 <= start <= end <= len(block.text)
             ):
                 raise DocumentError("candidate_range_invalid", 409)
+            if diagnostics is not None:
+                source_measurements.append(
+                    {"start": start, "end": end, "text": block.text[start:end]}
+                )
             orders = [order]
             related = block.raw_provenance.get("related_block_reading_orders", [])
             if isinstance(related, list):
@@ -174,6 +223,11 @@ def select_evidence(result, blocks_by_snapshot, *, token_budget, max_bytes):
                     if selected_order == order
                     else (0, len(selected.text))
                 )
+                if diagnostics is not None:
+                    expanded_measurements.append(
+                        {"start": left, "end": right, "text": selected.text[left:right]}
+                    )
+                    related_range_count += selected_order != order
                 key = (
                     candidate.paper_id,
                     candidate.document_version_id,
@@ -184,11 +238,30 @@ def select_evidence(result, blocks_by_snapshot, *, token_budget, max_bytes):
                     intervals[key] = []
                     priority.append(key)
                 intervals[key].append((left, right))
+                if selected_order == order:
+                    source_intervals.setdefault(key, []).append((left, right))
+                else:
+                    whole_block_keys.add(key)
                 candidate_flags.setdefault(key, set()).update(candidate.quality_flags)
+    if diagnostics is not None:
+        for stage, ranges in (
+            ("source_ranges", source_measurements),
+            ("expanded_ranges", expanded_measurements),
+        ):
+            diagnostics.record(
+                stage,
+                ranges,
+                range_count=len(ranges),
+                text_characters=sum(len(r["text"]) for r in ranges),
+                text_utf8_bytes=sum(len(r["text"].encode("utf-8")) for r in ranges),
+                related_range_count=related_range_count if stage == "expanded_ranges" else 0,
+            )
+    merged_measurements: list[_RangeMeasurement] = []
+    evidence_ordinal = 0
     for key in priority:
         paper, version, snapshot, order = key
         block = blocks_by_snapshot[snapshot][order]
-        merged = []
+        merged: list[tuple[int, int]] = []
         for left, right in sorted(intervals[key]):
             if merged and left <= merged[-1][1]:
                 merged[-1] = (merged[-1][0], max(merged[-1][1], right))
@@ -197,6 +270,10 @@ def select_evidence(result, blocks_by_snapshot, *, token_budget, max_bytes):
         for left, right in merged:
             if left == right:
                 continue
+            if diagnostics is not None:
+                merged_measurements.append(
+                    {"start": left, "end": right, "text": block.text[left:right]}
+                )
             evidence = Evidence(
                 alias=f"E{len(pack.evidence) + 1}",
                 paper_id=paper,
@@ -218,10 +295,76 @@ def select_evidence(result, blocks_by_snapshot, *, token_budget, max_bytes):
             )
             pack.evidence.append(evidence)
             measure_pack(pack)
+            evidence_ordinal += 1
+            if diagnostics is not None:
+                diagnostics.record(
+                    "evidence",
+                    evidence.model_dump(mode="json"),
+                    ordinal=evidence_ordinal,
+                    range_count=len(evidence.ranges),
+                    text_characters=right - left,
+                    text_utf8_bytes=len(block.text[left:right].encode("utf-8")),
+                )
+                diagnostics.record(
+                    "tentative_pack",
+                    pack.model_dump(mode="json"),
+                    ordinal=evidence_ordinal,
+                    item_count=len(pack.evidence),
+                    over_token_budget=pack.token_count > token_budget,
+                    over_byte_budget=pack.serialized_bytes > max_bytes,
+                    accepted=pack.token_count <= token_budget
+                    and pack.serialized_bytes <= max_bytes,
+                )
             if pack.token_count > token_budget or pack.serialized_bytes > max_bytes:
                 pack.evidence.pop()
                 pack.truncated = True
                 pack.continuation = "read_original_block_with_source_pagination"
+                # 仅拆回当前合并分量的候选来源区间；关联整块不改变选择策略。
+                # dict 保留候选原次序并去除完全重复区间，不使用重排窗口坐标。
+                local_ranges = list(
+                    dict.fromkeys(
+                        (start, end)
+                        for start, end in source_intervals.get(key, [])
+                        if left <= start < end <= right
+                    )
+                )
+                if key in whole_block_keys or len(local_ranges) < 2:
+                    continue
+                for start, end in local_ranges:
+                    local = evidence.model_copy(deep=True)
+                    local.evidence_id = uuid4()
+                    local.alias = f"E{len(pack.evidence) + 1}"
+                    local.ranges = [
+                        evidence.ranges[0].model_copy(
+                            update={"start": start, "end": end, "text": block.text[start:end]}
+                        )
+                    ]
+                    pack.evidence.append(local)
+                    measure_pack(pack)
+                    accepted = (
+                        pack.token_count <= token_budget and pack.serialized_bytes <= max_bytes
+                    )
+                    if diagnostics is not None:
+                        diagnostics.record(
+                            "fallback_pack",
+                            pack.model_dump(mode="json"),
+                            item_count=len(pack.evidence),
+                            text_characters=end - start,
+                            text_utf8_bytes=len(block.text[start:end].encode("utf-8")),
+                            over_token_budget=pack.token_count > token_budget,
+                            over_byte_budget=pack.serialized_bytes > max_bytes,
+                            accepted=accepted,
+                        )
+                    if not accepted:
+                        pack.evidence.pop()
+    if diagnostics is not None:
+        diagnostics.record(
+            "merged_ranges",
+            merged_measurements,
+            range_count=len(merged_measurements),
+            text_characters=sum(len(r["text"]) for r in merged_measurements),
+            text_utf8_bytes=sum(len(r["text"].encode("utf-8")) for r in merged_measurements),
+        )
     pack.uncovered_paper_ids = [
         UUID(m["paper_id"])
         for m in pack.scope.members
@@ -235,6 +378,14 @@ def select_evidence(result, blocks_by_snapshot, *, token_budget, max_bytes):
         else "insufficient_evidence"
     )
     measure_pack(pack)
+    if diagnostics is not None:
+        diagnostics.record(
+            "final_fields",
+            pack.model_dump(mode="json"),
+            item_count=len(pack.evidence),
+            over_token_budget=pack.token_count > token_budget,
+            over_byte_budget=pack.serialized_bytes > max_bytes,
+        )
     # 最终状态/覆盖字段也占预算；按整个证据重新选择，绝不切割封装。
     while pack.evidence and (pack.token_count > token_budget or pack.serialized_bytes > max_bytes):
         pack.evidence.pop()
@@ -246,6 +397,19 @@ def select_evidence(result, blocks_by_snapshot, *, token_budget, max_bytes):
             if UUID(m["paper_id"]) not in {e.paper_id for e in pack.evidence}
         ]
         measure_pack(pack)
+        if diagnostics is not None:
+            diagnostics.record(
+                "final_trim",
+                pack.model_dump(mode="json"),
+                item_count=len(pack.evidence),
+                removed_count=1,
+                over_token_budget=pack.token_count > token_budget,
+                over_byte_budget=pack.serialized_bytes > max_bytes,
+            )
+    if diagnostics is not None:
+        diagnostics.record(
+            "final_pack", pack.model_dump(mode="json"), item_count=len(pack.evidence)
+        )
     return pack
 
 
@@ -262,10 +426,13 @@ class EvidenceBuilder:
     def __init__(self, retrieval, *, max_bytes=48000):
         self.retrieval, self.max_bytes = retrieval, max_bytes
 
-    async def retrieve(self, request, *, source_cache=None, recall_paper_ids=None):
+    async def retrieve(
+        self, request, *, source_cache=None, recall_paper_ids=None, diagnostics=None
+    ):
         cache = {} if source_cache is None else source_cache
+        diagnostic_options = {} if diagnostics is None else {"diagnostics": diagnostics}
         result = await self.retrieval.retrieve(
-            request, source_cache=cache, recall_paper_ids=recall_paper_ids
+            request, source_cache=cache, recall_paper_ids=recall_paper_ids, **diagnostic_options
         )
         if "recall_unavailable" in result.statuses:
             raise DocumentError("recall_unavailable", 503)
@@ -279,7 +446,11 @@ class EvidenceBuilder:
                 ).all()
                 blocks[snapshot_id] = {row.reading_order: row for row in rows}
         pack = select_evidence(
-            result, blocks, token_budget=request.evidence_token_budget, max_bytes=self.max_bytes
+            result,
+            blocks,
+            token_budget=request.evidence_token_budget,
+            max_bytes=self.max_bytes,
+            diagnostics=diagnostics,
         )
         await self.retrieval._verify_active_members(pack.scope)
         await self.save(pack, request)

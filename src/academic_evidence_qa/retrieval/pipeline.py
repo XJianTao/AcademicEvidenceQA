@@ -27,6 +27,7 @@ from academic_evidence_qa.infrastructure.database.models import (
 from academic_evidence_qa.ingestion.index_builder import content_hash
 from academic_evidence_qa.retrieval.lexical import LexicalStatistics, query_vector
 from academic_evidence_qa.retrieval.reranking import rerank
+from academic_evidence_qa.retrieval.budget_diagnostics import EvidenceBudgetDiagnostics
 
 
 def reciprocal_rank_fusion(rankings, *, constant=60):
@@ -38,7 +39,7 @@ def reciprocal_rank_fusion(rankings, *, constant=60):
     Returns:
         (ID, 融合分数) 的稳定降序列表。
     """
-    scores = {}
+    scores: dict[str, float] = {}
     for ranking in rankings:
         for rank, identity in enumerate(dict.fromkeys(ranking), 1):
             scores[identity] = scores.get(identity, 0) + 1 / (constant + rank)
@@ -117,25 +118,38 @@ class RetrievalPipeline:
         if not {UUID(member["paper_id"]) for member in scope.members}.issubset(current):
             raise DocumentError("scope_membership_changed", 409)
 
-    async def retrieve(self, request, *, source_cache=None, recall_paper_ids=None):
+    async def retrieve(
+        self,
+        request,
+        *,
+        source_cache=None,
+        recall_paper_ids=None,
+        diagnostics: EvidenceBudgetDiagnostics | None = None,
+    ):
         """名称：固定范围检索。用途：有限期限内检索，可内部限定召回子集。
 
         Args:
             request: 原完整范围和固定代；定向补检索不得缩小此范围。
             source_cache: 请求内已核验快照。
             recall_paper_ids: 仅内部使用的非空论文子集，两路召回及来源拒绝均限制于此。
+            diagnostics: 可选离线数值计量；不改变检索或响应契约。
         Returns:
             完整 scope 下的候选；全部成员仍参与返回前 active 复核。
         """
         try:
             async with asyncio.timeout(360):
                 return await self._retrieve(
-                    request, source_cache=source_cache, recall_paper_ids=recall_paper_ids
+                    request,
+                    source_cache=source_cache,
+                    recall_paper_ids=recall_paper_ids,
+                    diagnostics=diagnostics,
                 )
         except TimeoutError as error:
             raise DocumentError("retrieval_timeout", 503) from error
 
-    async def _retrieve(self, request, *, source_cache=None, recall_paper_ids=None):
+    async def _retrieve(
+        self, request, *, source_cache=None, recall_paper_ids=None, diagnostics=None
+    ):
         started = time.monotonic()
         statuses, timings = [], {}
         async with self.database.sessions() as session:
@@ -315,6 +329,13 @@ class RetrievalPipeline:
                 raise DocumentError("candidate_source_mismatch", 409)
         rankings = [[str(h.id) for h in route] for route in (dense, sparse)]
         fused = reciprocal_rank_fusion(rankings)[:60]
+        if diagnostics is not None:
+            diagnostics.record(
+                "recall_counts",
+                dense_count=len(dense),
+                bm25_count=len(sparse),
+                fused_count=len(fused),
+            )
         scores_dense = {str(h.id): h.score for h in dense}
         scores_sparse = {str(h.id): h.score for h in sparse}
         ordered = (
@@ -331,6 +352,12 @@ class RetrievalPipeline:
             )
             for identity, score in ordered
         ]
+        if diagnostics is not None:
+            diagnostics.record(
+                "candidate_pool",
+                [c.model_dump(mode="json") for c in candidates],
+                item_count=len(candidates),
+            )
         source_started = time.monotonic()
         async with self.database.sessions() as session:
             for snapshot_id in sorted({c.parse_snapshot_id for c in candidates}, key=str):
@@ -374,6 +401,12 @@ class RetrievalPipeline:
         # 仅检查固定范围的 active 状态，不因正常发布或选版改变而混用新 generation。
         await self._verify_active_members(scope)
         timings["total_seconds"] = time.monotonic() - started
+        if diagnostics is not None:
+            diagnostics.record(
+                "candidate_reranked",
+                [c.model_dump(mode="json") for c in candidates],
+                item_count=len(candidates),
+            )
         return RetrievalResult(
             scope=scope,
             candidates=candidates[: request.limit],
