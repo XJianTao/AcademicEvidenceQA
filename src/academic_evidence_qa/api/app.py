@@ -15,7 +15,14 @@ import uvicorn
 from fastapi import FastAPI
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
+from pydantic import ValidationError
 
+from academic_evidence_qa.api.request_diagnostics import (
+    RequestDiagnosticsMiddleware,
+    configure_request_logging,
+    log_request_validation,
+    request_id,
+)
 from academic_evidence_qa.api.routes import router
 from academic_evidence_qa.api.routes import internal_router, retrieval_router
 from academic_evidence_qa.bootstrap import initialize_retrieval, close_retrieval
@@ -66,6 +73,7 @@ def create_app(settings=None, *, database=None, store=None, with_models=None):
                 await database.close()
 
     app = FastAPI(title="AcademicEvidenceQA 本地管理", lifespan=lifespan)
+    app.add_middleware(RequestDiagnosticsMiddleware)
     app.state.settings, app.state.database, app.state.store = settings, database, store
     app.state.management = ManagementService(database, store, settings)
     app.state.retrieval = None
@@ -79,6 +87,8 @@ def create_app(settings=None, *, database=None, store=None, with_models=None):
 
     @app.exception_handler(DocumentError)
     async def document_error(request, error):
+        if error.error_code == "request_invalid" and isinstance(error.__cause__, ValidationError):
+            log_request_validation(request, error.__cause__, body=True)
         return JSONResponse({"error_code": error.error_code}, status_code=error.status_code)
 
     @app.exception_handler(ParserError)
@@ -100,11 +110,17 @@ def create_app(settings=None, *, database=None, store=None, with_models=None):
 
     @app.exception_handler(RequestValidationError)
     async def validation_error(request, error):
+        log_request_validation(request, error)
         return JSONResponse({"error_code": "request_invalid"}, status_code=422)
 
     @app.exception_handler(Exception)
     async def unexpected_error(request, error):
-        return JSONResponse({"error_code": "service_unavailable"}, status_code=503)
+        # Starlette 的兜底 handler 位于用户中间件之外，显式沿用已绑定的关联标识。
+        return JSONResponse(
+            {"error_code": "service_unavailable"},
+            status_code=503,
+            headers={"X-Request-ID": request_id(request.scope)},
+        )
 
     app.include_router(router)
     app.include_router(internal_router)
@@ -131,6 +147,7 @@ def main():
         database_url=settings.database_url.set(database=args.database_name),
         data_root=args.data_root,
     )
+    configure_request_logging()
     server = uvicorn.Server(
         uvicorn.Config(
             create_app(settings),
