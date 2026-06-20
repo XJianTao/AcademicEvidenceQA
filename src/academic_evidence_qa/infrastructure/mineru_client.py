@@ -27,6 +27,7 @@ from academic_evidence_qa.infrastructure.mineru_http_transport import (
     HttpxMineruTransport,
     MineruTransport,
     MineruTransportError,
+    http_failure_reason,
     retryable_http_status,
 )
 
@@ -118,6 +119,7 @@ class MineruAttempt:
     remote_task_id: str | None = None
     last_stage: str = "created"
     submission_state: str = "not_started"
+    failure_reason: str | None = None
 
     def checkpoint(self) -> dict[str, str | None]:
         """输出可持久化的安全上下文；不序列化进程内 owner 或签名地址。"""
@@ -127,6 +129,7 @@ class MineruAttempt:
             "remote_task_id": self.remote_task_id,
             "last_stage": self.last_stage,
             "submission_state": self.submission_state,
+            **({"failure_reason": self.failure_reason} if self.failure_reason else {}),
         }
 
 
@@ -325,13 +328,20 @@ class MineruClient:
                 cancellation,
                 attempt=attempt,
             )
-        except MineruTransportError:
+        except MineruTransportError as error:
+            attempt.failure_reason = error.failure_reason()
             raise MineruClientError("submission_unknown", attempt=attempt) from None
         if status != 200:
+            attempt.failure_reason = http_failure_reason(status)
             raise MineruClientError("submission_unknown", attempt=attempt)
         try:
             batch_id, upload_url = _submission_fields(payload)
         except MineruClientError:
+            attempt.failure_reason = (
+                "remote_rejection"
+                if isinstance(payload, dict) and payload.get("code") not in (None, 0)
+                else "invalid_response"
+            )
             raise MineruClientError("submission_unknown", attempt=attempt) from None
         attempt.remote_task_id = batch_id
         attempt.submission_state = "known"
@@ -402,6 +412,11 @@ class MineruClient:
             try:
                 state, archive_url = _result_fields(payload)
             except MineruClientError as error:
+                attempt.failure_reason = (
+                    "remote_rejection"
+                    if isinstance(payload, dict) and payload.get("code") not in (None, 0)
+                    else "invalid_response"
+                )
                 raise MineruClientError(error.error_code, attempt=attempt) from None
             if state == "done":
                 if archive_url is None:
@@ -467,6 +482,7 @@ class MineruClient:
                 )
             except MineruTransportError as error:
                 if not error.retryable or attempts >= self.config.max_retries:
+                    attempt.failure_reason = error.failure_reason()
                     # 只接受本模块定义的稳定码，注入/远端异常正文不能成为日志摘要。
                     code = (
                         error.error_code
@@ -485,7 +501,7 @@ class MineruClient:
         if status in {200, 201, 204}:
             return
         raise MineruTransportError(
-            "remote_upload_http_error", retryable=retryable_http_status(status)
+            "remote_upload_http_error", retryable=retryable_http_status(status), http_status=status
         )
 
     async def _poll_once(self, remote_task_id: str, attempt: MineruAttempt) -> tuple[int, Any]:
@@ -499,7 +515,9 @@ class MineruClient:
         )
         if status != 200:
             raise MineruTransportError(
-                "remote_poll_http_error", retryable=retryable_http_status(status)
+                "remote_poll_http_error",
+                retryable=retryable_http_status(status),
+                http_status=status,
             )
         return status, payload
 

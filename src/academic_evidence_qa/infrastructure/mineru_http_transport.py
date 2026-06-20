@@ -15,6 +15,7 @@ import asyncio
 import json
 import logging
 import os
+import ssl
 from uuid import uuid4
 from collections.abc import AsyncIterator, Mapping
 from contextlib import asynccontextmanager
@@ -57,10 +58,32 @@ def _install_private_request_log_filter() -> None:
 class MineruTransportError(RuntimeError):
     """名称：传输层失败。用途概要：标记稳定错误码及请求是否可安全重放。"""
 
-    def __init__(self, error_code: str, *, retryable: bool):
+    def __init__(self, error_code: str, *, retryable: bool, http_status: int | None = None):
         self.error_code = error_code
         self.retryable = retryable
+        self.http_status = http_status
         super().__init__(error_code)
+
+    def failure_reason(self) -> str | None:
+        """只投影异常类型和 HTTP 状态，绝不将签名地址或第三方消息写入检查点。"""
+        if self.http_status is not None:
+            return http_failure_reason(self.http_status)
+        cause = self.__cause__
+        if isinstance(cause, httpx.ProxyError):
+            return "proxy_connect_failed"
+        if isinstance(cause, httpx.ConnectTimeout):
+            return "connect_timeout"
+        if isinstance(cause, httpx.ReadTimeout):
+            return "read_timeout"
+        if isinstance(cause, httpx.ConnectError):
+            while cause is not None:
+                if isinstance(cause, ssl.SSLError):
+                    return "tls_failed"
+                cause = cause.__cause__
+            return "connection_failed"
+        if self.error_code in {"remote_response_too_large", "remote_response_invalid"}:
+            return "invalid_response"
+        return "transport_failure" if isinstance(cause, httpx.HTTPError) else None
 
 
 class MineruTransport(Protocol):
@@ -91,7 +114,8 @@ class HttpxMineruTransport:
     _MAX_API_JSON_BYTES = 1024 * 1024
 
     def __init__(self, *, client: httpx.AsyncClient | None = None) -> None:
-        self._client = client or httpx.AsyncClient(follow_redirects=False, trust_env=True)
+        # API、预签名上传和结果 CDN 均直连，避免长驻 Worker 继承启动终端的代理。
+        self._client = client or httpx.AsyncClient(follow_redirects=False, trust_env=False)
         _install_private_request_log_filter()
 
     @asynccontextmanager
@@ -164,6 +188,7 @@ class HttpxMineruTransport:
                         raise MineruTransportError(
                             "remote_download_http_error",
                             retryable=retryable_http_status(response.status_code),
+                            http_status=response.status_code,
                         )
                     size_bytes = 0
                     with temporary.open("xb") as output:
@@ -207,6 +232,11 @@ async def _file_chunks(path: Path, chunk_bytes: int = 1024 * 1024) -> AsyncItera
     with path.open("rb") as source:
         while chunk := await asyncio.to_thread(source.read, chunk_bytes):
             yield chunk
+
+
+def http_failure_reason(status_code: int) -> str:
+    """远端返回非标准状态时只保留固定类别。"""
+    return f"http_{status_code}" if 100 <= status_code <= 599 else "invalid_response"
 
 
 def retryable_http_status(status_code: int) -> bool:

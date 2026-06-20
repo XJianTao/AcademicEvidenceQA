@@ -316,7 +316,8 @@ class ParseJobRunner:
                 break
             if task is None:
                 return None
-            recovering = task.state == "executing"
+            # 显式后继可在受理时绑定已上传的 batch；与过期租约共用只读恢复路径。
+            recovering = task.state == "executing" or task.remote_task_id is not None
             now = await session.scalar(select(func.clock_timestamp()))
             remaining_started = monotonic()
             task.executor_token = token
@@ -524,7 +525,12 @@ class ParseJobRunner:
             with suppress(Exception):
                 async with self.database.transaction() as session:
                     await self.service.fail_parse_task(
-                        session, parse_task_id=job_id, executor_token=token, error_code=code
+                        session,
+                        parse_task_id=job_id,
+                        executor_token=token,
+                        error_code=code,
+                        remote_task_id=attempt.remote_task_id if attempt else None,
+                        checkpoint=attempt.checkpoint() if attempt else None,
                     )
             return {**summary, "status": "cancelled" if cancelled else "failed", "error_code": code}
         finally:

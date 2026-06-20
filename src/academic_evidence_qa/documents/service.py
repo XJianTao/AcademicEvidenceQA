@@ -333,6 +333,23 @@ class DocumentService:
         """持久化已知远端标识和可继续检查点，不执行网络请求。"""
         self._require_transaction(session)
         task = await self._locked_executing_task(session, parse_task_id, executor_token)
+        self._apply_parse_checkpoint(task, remote_task_id, checkpoint)
+        if task.cancel_requested:
+            task.state, task.stage = "cancelled", "cancelled"
+            task.error_code = (
+                "remote_cancellation_unknown" if task.remote_task_id else "parse_task_cancelled"
+            )
+        else:
+            task.stage = stage
+        task.updated_at = datetime.now(timezone.utc)
+        await session.flush()
+        return self._task_checkpoint(task)
+
+    @staticmethod
+    def _apply_parse_checkpoint(
+        task: ParseTask, remote_task_id: str | None, checkpoint: dict | None
+    ) -> None:
+        """在已验证租约的行锁内更新检查点，进度和失败提交遵守相同的身份与期限约束。"""
         if checkpoint is not None and (
             not isinstance(checkpoint, dict) or checkpoint.get("attempt_id") != str(task.attempt_id)
         ):
@@ -351,16 +368,6 @@ class DocumentService:
             task.remote_task_id = remote_task_id
         if checkpoint is not None:
             task.checkpoint = checkpoint
-        if task.cancel_requested:
-            task.state, task.stage = "cancelled", "cancelled"
-            task.error_code = (
-                "remote_cancellation_unknown" if task.remote_task_id else "parse_task_cancelled"
-            )
-        else:
-            task.stage = stage
-        task.updated_at = datetime.now(timezone.utc)
-        await session.flush()
-        return self._task_checkpoint(task)
 
     async def fail_parse_task(
         self,
@@ -369,10 +376,13 @@ class DocumentService:
         parse_task_id: UUID,
         executor_token: UUID,
         error_code: str,
+        remote_task_id: str | None = None,
+        checkpoint: dict | None = None,
     ) -> ParseTaskCheckpoint:
         """将已受理任务标记为失败或取消，稳定错误码不保存远端原文。"""
         self._require_transaction(session)
         task = await self._locked_executing_task(session, parse_task_id, executor_token)
+        self._apply_parse_checkpoint(task, remote_task_id, checkpoint)
         task.state = "cancelled" if task.cancel_requested else "failed"
         task.stage = task.state
         task.error_code = error_code

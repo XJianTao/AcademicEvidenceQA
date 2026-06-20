@@ -160,6 +160,11 @@ class JobResponse(BaseModel):
     cancel_requested: bool
     retry_of_job_id: UUID | None
     retry_job_ids: list[UUID]
+    remote_stage: Literal["submit", "upload", "poll", "download"] | None = None
+    failure_reason: str | None = Field(
+        default=None,
+        pattern=r"^(http_[1-5][0-9]{2}|proxy_connect_failed|connect_timeout|read_timeout|tls_failed|connection_failed|invalid_response|remote_rejection|transport_failure)$",
+    )
     library_id: UUID | None
     document_version_id: UUID | None = None
     parse_snapshot_id: UUID | None = None

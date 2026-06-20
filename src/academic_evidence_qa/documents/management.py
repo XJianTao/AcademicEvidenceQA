@@ -11,6 +11,7 @@ import json
 import re
 import os
 from dataclasses import asdict
+from datetime import timedelta
 
 from sqlalchemy import select, func
 
@@ -450,6 +451,7 @@ class ManagementService:
                 )
                 created = await session.get(ParseTask, result.parse_task_id)
                 created.library_id, created.retry_of_job_id = parse.library_id, job_id
+                await self._bind_remote_retry(session, parse, created)
             index_job = None
             if parse.library_id:
                 index_job = await self._index_job(session, library)
@@ -466,6 +468,39 @@ class ManagementService:
             }
 
         return await self.submit(key, f"{'retry' if retry else 'cancel'}:{job_id}", {}, action)
+
+    async def _bind_remote_retry(self, session, parent: ParseTask, child: ParseTask) -> None:
+        """将显式重试绑定到已上传的批次。子任务使用新期限，租约接管沿用该期限。"""
+        checkpoint = parent.checkpoint
+        past_upload = checkpoint.get("last_stage") in ("poll", "download")
+        recoverable = parent.error_code in {
+            "remote_download_transport_failure",
+            "remote_download_timeout",
+            "remote_download_http_error",
+            "remote_transport_failure",
+            "remote_poll_http_error",
+            "remote_timeout",
+        }
+        if not recoverable and not (past_upload and parent.error_code == "remote_total_timeout"):
+            return
+        if (
+            not past_upload
+            or not parent.remote_task_id
+            or checkpoint.get("remote_task_id") != parent.remote_task_id
+            or checkpoint.get("attempt_id") != str(parent.attempt_id)
+            or checkpoint.get("submission_state") != "known"
+        ):
+            raise DocumentError("attempt_checkpoint_invalid", 409)
+        now = await session.scalar(select(func.clock_timestamp()))
+        expires = now + timedelta(seconds=self.settings.mineru_job_timeout_seconds)
+        child.remote_task_id, child.stage = parent.remote_task_id, "poll"
+        child.checkpoint = {
+            "attempt_id": str(child.attempt_id),
+            "expires_at": expires.isoformat(),
+            "remote_task_id": parent.remote_task_id,
+            "last_stage": "poll",
+            "submission_state": "known",
+        }
 
     async def read_job(self, job_id):
         async with self.database.sessions() as session:
@@ -496,6 +531,10 @@ class ManagementService:
                 ).all()
             )
             if parse:
+                # 旧检查点可能仅记录 created；本地解包或索引失败不能标成远端故障。
+                if task.state == "failed" and task.checkpoint.get("failure_reason"):
+                    result["remote_stage"] = task.checkpoint["last_stage"]
+                    result["failure_reason"] = task.checkpoint["failure_reason"]
                 result.update(
                     document_version_id=task.document_version_id,
                     parse_snapshot_id=task.parse_snapshot_id,
