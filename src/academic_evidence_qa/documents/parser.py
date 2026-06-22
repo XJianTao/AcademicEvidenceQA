@@ -31,8 +31,29 @@ from academic_evidence_qa.infrastructure.process_guard import (
 )
 from academic_evidence_qa.mineru_adapter import normalize_mineru_block
 
-# 空内容及 NUL 质量门改变缓存可用性，版本必须随规则升级，避免复用旧判断。
-ADAPTER_VERSION = "m1b_normalizer_v3"
+# v4 接入原文标题入库；配置哈希包含此版本，重新导入时不复用尚未提取标题的旧快照。
+ADAPTER_VERSION = "m1b_normalizer_v4"
+
+
+def extract_paper_title(document: ParsedDocument) -> str | None:
+    """从全文唯一且位于首页的非空一级章节提取题目。
+
+    Args:
+        document: 已归一化的解析结果；不读取文件名或推断缺失页码。
+    Returns:
+        合并空白后的原文题目；候选不唯一、位置不确定或超过元数据容量时为空。
+    """
+    candidates = [
+        section for section in document.sections
+        if section.level == 1 and section.title and section.title.strip()
+    ]
+    if len(candidates) != 1:
+        return None
+    section = candidates[0]
+    if not section.locations or any(location.page_index != 0 for location in section.locations):
+        return None
+    title = " ".join(section.title.split())
+    return title if len(title) <= 1024 else None
 
 
 class ParserError(RuntimeError):

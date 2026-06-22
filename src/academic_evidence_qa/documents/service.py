@@ -19,7 +19,7 @@ from typing import BinaryIO
 from uuid import UUID
 
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, func
+from sqlalchemy import select, func, update
 from sqlalchemy.orm import SessionTransactionOrigin
 
 from academic_evidence_qa.contracts.documents import (
@@ -32,6 +32,7 @@ from academic_evidence_qa.contracts.documents import (
 )
 from academic_evidence_qa.contracts.jobs import ParseTaskCheckpoint, ParseTaskRequest
 from academic_evidence_qa.documents.filenames import normalize_original_filename
+from academic_evidence_qa.documents.parser import extract_paper_title
 from academic_evidence_qa.infrastructure.database import repositories
 from academic_evidence_qa.infrastructure.database.models import (
     BuildIntent,
@@ -481,6 +482,15 @@ class DocumentService:
                 snapshot.normalized_artifact_key,
                 expected_sha256=snapshot.normalized_artifact_sha256,
             )
+        # 标题与来源快照同事务提交；条件更新避免覆盖其他版本或用户已有标题。
+        if task.parser_backend == "mineru_remote":
+            title = extract_paper_title(document)
+            if title is not None:
+                await session.execute(
+                    update(Paper)
+                    .where(Paper.paper_id == version.paper_id, Paper.title.is_(None))
+                    .values(title=title)
+                )
         task.state, task.stage, task.error_code = "completed", "completed", None
         task.parse_snapshot_id = snapshot.parse_snapshot_id
         task.updated_at = datetime.now(timezone.utc)
