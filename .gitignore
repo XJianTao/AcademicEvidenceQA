@@ -7,6 +7,8 @@ __pycache__/
 *.py[cod]
 *.egg-info/
 .codex/
+.planning/
+.vscode/
 .coverage
 htmlcov/
 *.log
@@ -15,5 +17,11 @@ htmlcov/
 data/
 storage/
 artifacts/
+docs/
+evaluation/
+tests/
+AGENTS.md
 frontend/node_modules/
 frontend/dist/
+frontend/.vite/
+frontend/coverage/
